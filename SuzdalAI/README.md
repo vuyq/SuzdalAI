@@ -5,6 +5,6 @@
 ## Установка
 
 ```bash
-git clone https://github.com/yourname/suzdal_ai.git
+git clone https://github.com/vuyq/suzdal_ai.git
 cd suzdal_ai
 pip install -r requirements.txt
