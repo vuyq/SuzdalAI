@@ -11,10 +11,3 @@ CERT_PATH=/path/to/certificate.pem_сертификат_для_работы
 
 Нужно создать файл с разрешением .env и поместить туда исправленные под нужный проект данные конфигурации. Расположение поулчившегося файла должно быть в основной папке там, где README.md
 
-## Установка
-
-```bash
-git clone https://github.com/vuyq/suzdal_ai.git
-cd suzdal_ai
-pip install -r requirements.txt
-
