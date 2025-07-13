@@ -6,4 +6,5 @@ uuid
 python-dotenv
 tenacity
 langchain>=0.1.0
-langchain_gigachat
+langchain-community
+langchain-gigachat
