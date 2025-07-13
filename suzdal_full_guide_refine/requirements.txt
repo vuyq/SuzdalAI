@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+requests
+pandas
+python-dotenv
+langchain
+langchain_gigachat
+tenacity

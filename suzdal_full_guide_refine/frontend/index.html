@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Гид по Суздалю</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 600px; margin: 2rem auto; }
+    textarea { width: 100%; height: 100px; }
+    button { margin-top: 1rem; padding: 10px 20px; }
+    pre { margin-top: 1rem; background: #f8f8f8; padding: 1rem; }
+  </style>
+</head>
+<body>
+  <h1>Гид по достопримечательностям Суздаля</h1>
+  <textarea id="question" placeholder="Введите ваш вопрос..."></textarea>
+  <button onclick="askQuestion()">Спросить</button>
+  <pre id="answer"></pre>
+
+  <script>
+    async function askQuestion() {
+      const question = document.getElementById("question").value.trim();
+      const answerBox = document.getElementById("answer");
+      if (!question) {
+        alert("Пожалуйста, введите вопрос.");
+        return;
+      }
+      answerBox.textContent = "Загрузка...";
+      try {
+        const response = await fetch("http://localhost:8001/ask", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({question})
+        });
+        const data = await response.json();
+        answerBox.textContent = data.answer || "Нет ответа от сервера.";
+      } catch (e) {
+        answerBox.textContent = "Ошибка: " + e.message;
+      }
+    }
+  </script>
+</body>
+</html>
