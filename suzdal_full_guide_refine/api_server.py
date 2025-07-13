@@ -75,7 +75,7 @@ except Exception as e:
     print(f"Ошибка инициализации: {str(e)}")
     raise
 
-csv_file_path = "https://raw.githubusercontent.com/vuyq/SuzdalAI/refs/heads/main/SuzdalAI/app/data/suzdal_attractions.csv"  
+csv_file_path = "https://raw.githubusercontent.com/vuyq/SuzdalAI/refs/heads/main/suzdal_full_guide_refine/suzdal_attractions.csv"  
 try:
     df = pd.read_csv(csv_file_path, sep=';')
 except Exception:
