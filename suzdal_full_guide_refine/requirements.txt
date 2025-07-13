@@ -8,3 +8,4 @@ tenacity
 langchain>=0.1.0
 langchain-community
 langchain-gigachat
+faiss-cpu
