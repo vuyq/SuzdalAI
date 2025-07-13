@@ -1,8 +1,9 @@
 fastapi
 uvicorn
-requests
 pandas
+requests
+uuid
 python-dotenv
-langchain
-langchain_gigachat
 tenacity
+langchain>=0.1.0
+langchain_gigachat
