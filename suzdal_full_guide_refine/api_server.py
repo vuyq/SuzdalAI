@@ -18,8 +18,8 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 load_dotenv()
 
 GIGACHAT_AUTH = os.getenv("GIGACHAT_AUTH") 
-CERT_PATH = 'https://raw.githubusercontent.com/vuyq/SuzdalAI/refs/heads/main/suzdal_full_guide_refine/russian_trusted_root_ca.cer'
-CERT_URL = 'https://raw.githubusercontent.com/vuyq/SuzdalAI/refs/heads/main/suzdal_full_guide_refine/russian_trusted_root_ca.cer'
+CERT_URL = os.getenv("CERT_URL")
+CERT_PATH = os.getenv("CERT_PATH")
 
 if not Path(CERT_PATH).exists():
     try:
