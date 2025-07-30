@@ -186,6 +186,12 @@ app.add_middleware(
 @app.post("/ask")
 async def ask_question(question: str = Body(..., embed=True)):
     try:
+        logger.info(f"Processing question: {question}")
+        docs = retriever.invoke(question)
+        logger.info(f"Retrieved {len(docs)} documents")
+        context = format_context(docs)
+        logger.info(f"Formatted context: {context[:200]}...")
+        
         answer = rag_chain.invoke(question)
         return {
             "answer": answer,
@@ -195,6 +201,7 @@ async def ask_question(question: str = Body(..., embed=True)):
             }
         }
     except Exception as e:
+        logger.error(f"Error processing question: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/feedback")
