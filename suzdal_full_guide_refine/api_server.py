@@ -1,10 +1,11 @@
 import os
 import requests
 import pandas as pd
+import uvicorn
 from pathlib import Path
 from typing import Optional
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 from langchain_core.documents import Document
 from langchain_gigachat import GigaChat, GigaChatEmbeddings
@@ -165,7 +166,7 @@ app.add_middleware(
 )
 
 @app.post("/ask")
-async def ask_question(question: str):
+async def ask_question(question: str = Body(..., embed=True)):
     try:
         answer = rag_chain.invoke(question)
         return {
@@ -179,7 +180,10 @@ async def ask_question(question: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/feedback")
-async def handle_feedback(is_helpful: bool, comment: Optional[str] = None):
+async def handle_feedback(
+    is_helpful: bool = Body(...),
+    comment: Optional[str] = Body(None)
+):
     try:
         if is_helpful:
             return {"message": "Спасибо за ваш отзыв!"}
@@ -189,4 +193,4 @@ async def handle_feedback(is_helpful: bool, comment: Optional[str] = None):
         raise HTTPException(status_code=400, detail=str(e))
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=800)
