@@ -1,11 +1,16 @@
 import os
 import ssl
+import json
+import logging
 import requests
+import uvicorn
 import pandas as pd
 from pathlib import Path
+from datetime import datetime
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from langchain_core.documents import Document
 from langchain_gigachat import GigaChat, GigaChatEmbeddings
@@ -14,8 +19,11 @@ from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnableParallel, RunnablePassthrough
 from tenacity import retry, stop_after_attempt, wait_exponential
-from langchain_community.tools import DuckDuckGoSearchRun
-from langchain_community.utilities import DuckDuckGoSearchAPIWrapper
+from ddgs import DDGS
+
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Загрузка переменных окружения
 load_dotenv()
@@ -25,6 +33,22 @@ GIGACHAT_AUTH = os.getenv("GIGACHAT_AUTH")
 CERT_URL = os.getenv("CERT_URL")
 CERT_PATH = os.getenv("CERT_PATH")
 CSV_URL = "https://raw.githubusercontent.com/vuyq/SuzdalAI/refs/heads/main/suzdal_full_guide_refine/attractions.csv"
+FEEDBACK_DB = "feedback.json"
+
+# Модели данных
+class Question(BaseModel):
+    question: str
+
+class FeedbackRequest(BaseModel):
+    question: str
+    answer: str
+    feedback: str
+
+class Feedback(BaseModel):
+    question: str
+    answer: str
+    is_helpful: bool
+    timestamp: str
 
 # Проверка и загрузка сертификата
 def setup_certificate():
@@ -34,9 +58,10 @@ def setup_certificate():
             response.raise_for_status()
             with open(CERT_PATH, "wb") as f:
                 f.write(response.content)
-            print("Сертификат успешно скачан")
+            logger.info("Сертификат успешно скачан")
         except Exception as e:
-            raise Exception(f"Не удалось скачать сертификат: {str(e)}")
+            logger.error(f"Не удалось скачать сертификат: {str(e)}")
+            raise
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
 def get_gigachat_token():
@@ -59,38 +84,40 @@ def get_gigachat_token():
         response.raise_for_status()
         return response.json().get("access_token")
     except requests.exceptions.RequestException as e:
-        raise Exception(f"Ошибка получения токена: {str(e)}")
+        logger.error(f"Ошибка получения токена: {str(e)}")
+        raise
 
 def initialize_models():
     try:
         access_token = get_gigachat_token()
-        print("Токен успешно получен")
+        logger.info("Токен успешно получен")
+        
+        # Создаем SSL контекст один раз
+        ssl_context = ssl.create_default_context(cafile=CERT_PATH)
         
         embedding_model = GigaChatEmbeddings(
             access_token=access_token,
             model="Embeddings",
             scope="GIGACHAT_API_PERS",
-            verify_ssl_certs=True,
-            ca_bundle_file=CERT_PATH
+            verify=ssl_context
         )
         
         ai_assistant = GigaChat(
             access_token=access_token,
             model="GigaChat-2",
-            temperature=0.2,  # Немного повысим для более естественных ответов
-            verify_ssl_certs=True,
-            ca_bundle_file=CERT_PATH
+            temperature=0.2,
+            verify=ssl_context
         )
         
         return embedding_model, ai_assistant
     except Exception as e:
-        print(f"Ошибка инициализации: {str(e)}")
+        logger.error(f"Ошибка инициализации: {str(e)}")
         raise
 
 # Инициализация компонентов
 setup_certificate()
 embedding_model, ai_assistant = initialize_models()
-search = DuckDuckGoSearchRun(api_wrapper=DuckDuckGoSearchAPIWrapper(max_results=3))
+search = DDGS()  # Инициализация нового поисковика
 
 # Загрузка данных
 def load_data():
@@ -100,7 +127,8 @@ def load_data():
         try:
             df = pd.read_csv(CSV_URL, on_bad_lines='skip')
         except Exception as e:
-            raise Exception(f"Не удалось загрузить данные: {str(e)}")
+            logger.error(f"Не удалось загрузить данные: {str(e)}")
+            raise
     
     return [
         Document(
@@ -172,10 +200,12 @@ def format_address(context_docs: list) -> str:
 
 def perform_web_search(question: str) -> str:
     try:
-        search_results = search.run(f"site:ru {question} Суздаль")
-        return search_results if search_results else "Не найдено информации в интернете"
+        results = search.text(f"{question} Суздаль", region='ru-ru', max_results=3)
+        if results:
+            return "\n".join([f"{r['title']}: {r['body']} (Источник: {r['href']})" for r in results])
+        return "Не найдено информации в интернете"
     except Exception as e:
-        print(f"Ошибка при поиске в интернете: {e}")
+        logger.error(f"Ошибка при поиске в интернете: {e}")
         return "Не удалось выполнить поиск в интернете"
 
 def is_answer_in_context(context: list) -> bool:
@@ -197,7 +227,7 @@ def prepare_prompt_input(question: str, context: list, web_search: str = "") -> 
 
 def refine_question(question: str) -> str:
     question = question.strip()
-    if len(question.split()) < 3:  # Уменьшил порог для более частых уточнений
+    if len(question.split()) < 3:
         suggestions = [
             "интересные музеи", 
             "места для детей",
@@ -211,6 +241,46 @@ def refine_question(question: str) -> str:
             "\n\nИли задайте более конкретный вопрос."
         )
     return None
+
+def save_feedback(feedback: Feedback) -> None:
+    try:
+        data = []
+        if Path(FEEDBACK_DB).exists():
+            with open(FEEDBACK_DB, "r") as f:
+                data = json.load(f)
+        
+        data.append(feedback.dict())
+        
+        with open(FEEDBACK_DB, "w") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"Ошибка сохранения фидбека: {e}")
+
+def add_feedback_question(answer: str) -> str:
+    if "Был ли полезен этот ответ?" not in answer:
+        return answer + "\n\nБыл ли полезен этот ответ? (Да/Нет)"
+    return answer
+
+def process_feedback(question: str, answer: str, user_response: str) -> str:
+    user_response = user_response.lower().strip()
+    if user_response in ['да', 'yes', 'д', 'y']:
+        is_helpful = True
+        response = "Спасибо за ваш отзыв! Рад, что информация была полезной."
+    elif user_response in ['нет', 'no', 'н', 'n']:
+        is_helpful = False
+        response = "Спасибо за отзыв! Постараюсь улучшить свои ответы."
+    else:
+        return "Не понял ваш ответ. Пожалуйста, ответьте 'Да' или 'Нет'."
+
+    feedback = Feedback(
+        question=question,
+        answer=answer,
+        is_helpful=is_helpful,
+        timestamp=datetime.now().isoformat()
+    )
+    save_feedback(feedback)
+    
+    return response
 
 rag_pipeline = (
     RunnableParallel(
@@ -226,13 +296,16 @@ rag_pipeline = (
     | StrOutputParser()
 )
 
-def ask_question(question: str) -> str:
+def ask_question(question: str, is_feedback: bool = False, prev_answer: str = "") -> str:
+    if is_feedback:
+        return process_feedback(question, prev_answer, question)
+    
     if not question.strip():
-        return "Пожалуйста, задайте ваш вопрос о Суздале."
+        return add_feedback_question("Пожалуйста, задайте ваш вопрос о Суздале.")
     
     refinement = refine_question(question)
     if refinement:
-        return refinement
+        return add_feedback_question(refinement)
     
     try:
         context = document_retriever.invoke(question)
@@ -251,23 +324,18 @@ def ask_question(question: str) -> str:
                     "К сожалению, я не нашел информации по вашему запросу.\n"
                     "Можете переформулировать вопрос или уточнить, что именно вас интересует?\n"
                     "Например, вы можете спросить о:\n- музеях\n- ресторанах\n- исторических местах\n"
-                    "Был ли полезен этот ответ? (Да/Нет)"
                 )
         
-        # Добавляем вопрос о качестве ответа, если его еще нет
-        if "Был ли полезен этот ответ?" not in response:
-            response += "\n\nБыл ли полезен этот ответ? (Да/Нет)"
-            
-        return response
+        return add_feedback_question(response)
     except Exception as e:
-        print(f"Ошибка обработки запроса: {e}")
-        return (
-            "Произошла ошибка при обработке вашего запроса. Пожалуйста, попробуйте позже.\n"
-            "Был ли полезен этот ответ? (Да/Нет)"
+        logger.error(f"Ошибка обработки запроса: {e}")
+        return add_feedback_question(
+            "Произошла ошибка при обработке вашего запроса. Пожалуйста, попробуйте позже."
         )
 
 # FastAPI приложение
 app = FastAPI(title="Suздаль Tourism Assistant")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -276,8 +344,31 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-class Question(BaseModel):
-    question: str
+@app.middleware("http")
+async def log_requests(request, call_next):
+    logger.info(f"Request: {request.method} {request.url}")
+    response = await call_next(request)
+    logger.info(f"Response: {response.status_code}")
+    return response
+
+@app.get("/")
+async def root():
+    return {
+        "message": "Добро пожаловать в API туристического помощника по Суздалю!",
+        "endpoints": {
+            "ask": "POST /ask для вопросов о городе",
+            "feedback": "GET /feedback для просмотра отзывов",
+            "health": "GET /health для проверки работы сервиса"
+        }
+    }
+
+@app.get('/favicon.ico', include_in_schema=False)
+async def favicon():
+    return FileResponse('favicon.ico')
+
+@app.get("/health")
+async def health_check():
+    return {"status": "OK", "service": "Suздаль Tourism Assistant"}
 
 @app.post("/ask")
 async def ask(item: Question):
@@ -285,8 +376,33 @@ async def ask(item: Question):
         response = ask_question(item.question)
         return {"answer": response}
     except Exception as e:
+        logger.error(f"Error in /ask: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+
+@app.post("/feedback")
+async def submit_feedback(item: FeedbackRequest):
+    try:
+        response = ask_question(
+            question=item.feedback,
+            is_feedback=True,
+            prev_answer=item.answer
+        )
+        return {"answer": response}
+    except Exception as e:
+        logger.error(f"Error in /feedback: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+
+@app.get("/feedback")
+async def get_feedback():
+    try:
+        if Path(FEEDBACK_DB).exists():
+            with open(FEEDBACK_DB, "r") as f:
+                return json.load(f)
+        return []
+    except Exception as e:
+        logger.error(f"Error getting feedback: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    port = int(os.getenv("PORT", 8001))
+    uvicorn.run(app, host="0.0.0.0", port=port)
