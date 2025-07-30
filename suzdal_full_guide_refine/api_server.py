@@ -1,11 +1,14 @@
 import os
+import logging
+import asyncio
+import time
 import requests
+import uvicorn
 import pandas as pd
 from pathlib import Path
-import logging
 from typing import Optional
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Body
+from fastapi import FastAPI, HTTPException, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
 from langchain_core.documents import Document
 from langchain_gigachat import GigaChat, GigaChatEmbeddings
@@ -17,6 +20,13 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 from langchain_community.tools import DuckDuckGoSearchRun
 from langchain_community.utilities import DuckDuckGoSearchAPIWrapper
 
+# Настройка логгирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
 # Загрузка конфигурации
 load_dotenv()
 
@@ -25,6 +35,11 @@ GIGACHAT_AUTH = os.getenv("GIGACHAT_AUTH")
 CERT_URL = os.getenv("CERT_URL")
 CERT_PATH = os.getenv("CERT_PATH")
 
+# Глобальные переменные для кэширования
+GIGA_CHAT_INSTANCE = None
+VECTOR_STORE = None
+SEARCH_TOOL = None
+
 # Скачивание сертификата
 if not Path(CERT_PATH).exists():
     try:
@@ -32,9 +47,10 @@ if not Path(CERT_PATH).exists():
         response.raise_for_status()
         with open(CERT_PATH, "wb") as f:
             f.write(response.content)
-        print("Сертификат успешно загружен")
+        logger.info("Сертификат успешно загружен")
     except Exception as e:
-        raise Exception(f"Ошибка загрузки сертификата: {str(e)}")
+        logger.error(f"Ошибка загрузки сертификата: {str(e)}")
+        raise
 
 # Получение токена GigaChat
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
@@ -62,7 +78,7 @@ def get_gigachat_token():
 def init_gigachat():
     try:
         access_token = get_gigachat_token()
-        print("Токен GigaChat успешно получен")
+        logger.info("Токен GigaChat успешно получен")
         return GigaChat(
             access_token=access_token,
             model="GigaChat-2",
@@ -71,26 +87,18 @@ def init_gigachat():
             ca_bundle_file=CERT_PATH
         )
     except Exception as e:
-        raise Exception(f"Ошибка инициализации GigaChat: {str(e)}")
-
-# Инициализация компонентов
-try:
-    ai_assistant = init_gigachat()
-    search = DuckDuckGoSearchRun(api_wrapper=DuckDuckGoSearchAPIWrapper(max_results=3))
-    print("Компоненты успешно инициализированы")
-except Exception as e:
-    print(f"Ошибка инициализации: {str(e)}")
-    raise
+        logger.error(f"Ошибка инициализации GigaChat: {str(e)}")
+        raise
 
 # Загрузка данных
 def load_attractions_data():
     csv_url = "https://raw.githubusercontent.com/vuyq/SuzdalAI/main/suzdal_full_guide_refine/attractions.csv"
     try:
         df = pd.read_csv(csv_url, sep=';')
-        print(f"Загружено {len(df)} достопримечательностей")
+        logger.info(f"Загружено {len(df)} достопримечательностей")
         return df
     except Exception as e:
-        print(f"Ошибка загрузки данных: {str(e)}")
+        logger.error(f"Ошибка загрузки данных: {str(e)}")
         raise
 
 # Создание векторного хранилища
@@ -110,24 +118,17 @@ def create_vector_store(df):
         )
         for _, row in df.iterrows()
     ]
-    print(f"Создано {len(documents)} документов для векторного поиска")
-    return FAISS.from_documents(documents, GigaChatEmbeddings(
+    logger.info(f"Создано {len(documents)} документов для векторного поиска")
+    
+    embeddings = GigaChatEmbeddings(
         access_token=get_gigachat_token(),
         model="Embeddings",
         scope="GIGACHAT_API_PERS",
         verify_ssl_certs=True,
         ca_bundle_file=CERT_PATH
-    ))
-
-# Инициализация данных
-try:
-    df = load_attractions_data()
-    vector_store = create_vector_store(df)
-    retriever = vector_store.as_retriever(search_kwargs={"k": 5})
-    print("Векторное хранилище создано")
-except Exception as e:
-    print(f"Ошибка инициализации данных: {str(e)}")
-    raise
+    )
+    
+    return FAISS.from_documents(documents, embeddings)
 
 # Шаблон ответа на русском языке
 prompt_template = PromptTemplate.from_template("""
@@ -139,40 +140,49 @@ prompt_template = PromptTemplate.from_template("""
 Сформируй развернутый ответ, включив ВСЕ подходящие варианты. Для каждого места укажи:
 
 📍 {название из metadata}
-🎯 {type из metadata}
-❤️ Почему стоит посетить: [краткое описание уникальных особенностей]
-🔍 [интересные детали и исторические факты]
-📌 Адрес: {address из metadata}
+{type из metadata}
+[краткое описание уникальных особенностей]
+[интересные детали и исторические факты]
+{address из metadata}
 💡 Важно: [практическая информация или советы]
 
 Если вариантов несколько - разделяй их пустой строкой.
 """)
 
-# Форматирование контекста
+# Оптимизированная функция форматирования контекста
 def format_context(docs):
-    formatted = []
-    for doc in docs:
-        content_lines = doc.page_content.split('\n')
-        description = next((line.split(':')[1].strip() for line in content_lines if line.startswith('Description:')), "не указано")[0]
-        
-        formatted.append(
-            f"Название: {doc.metadata['title']}\n"
-            f"Тип: {doc.metadata['type']}\n"
-            f"Адрес: {doc.metadata.get('address', 'не указан')}\n"
-            f"Описание: {description[:200]}{'...' if len(description) > 200 else ''}"
-        )
-    return "\n\n".join(formatted)
+    return "\n\n".join(
+        f"Название: {doc.metadata['title']}\n"
+        f"Тип: {doc.metadata['type']}\n"
+        f"Адрес: {doc.metadata.get('address', 'не указан')}\n"
+        f"Описание: {doc.page_content[:200]}{'...' if len(doc.page_content) > 200 else ''}"
+        for doc in docs
+    )
 
-# Цепочка обработки
-rag_chain = (
-    RunnableParallel({
-        "context": retriever | format_context,
-        "question": RunnablePassthrough()
-    })
-    | prompt_template
-    | ai_assistant
-    | StrOutputParser()
-)
+# Инициализация сервисов при старте приложения
+async def initialize_services():
+    global GIGA_CHAT_INSTANCE, VECTOR_STORE, SEARCH_TOOL
+    
+    try:
+        # Инициализация GigaChat
+        if GIGA_CHAT_INSTANCE is None:
+            GIGA_CHAT_INSTANCE = init_gigachat()
+        
+        # Загрузка данных и создание векторного хранилища
+        if VECTOR_STORE is None:
+            df = load_attractions_data()
+            VECTOR_STORE = create_vector_store(df)
+        
+        # Инициализация поискового инструмента
+        if SEARCH_TOOL is None:
+            SEARCH_TOOL = DuckDuckGoSearchRun(
+                api_wrapper=DuckDuckGoSearchAPIWrapper(max_results=2)
+            )
+        
+        logger.info("Все сервисы успешно инициализированы")
+    except Exception as e:
+        logger.error(f"Ошибка инициализации сервисов: {str(e)}")
+        raise
 
 # FastAPI приложение
 app = FastAPI()
@@ -184,26 +194,46 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Инициализация при старте
+@app.on_event("startup")
+async def startup_event():
+    await initialize_services()
+
 @app.post("/ask")
 async def ask_question(question: str = Body(..., embed=True)):
     try:
-        logger.info(f"Processing question: {question}")
-        docs = retriever.invoke(question)
-        logger.info(f"Retrieved {len(docs)} documents")
-        context = format_context(docs)
-        logger.info(f"Formatted context: {context[:200]}...")
+        start_time = time.time()
         
-        answer = rag_chain.invoke(question)
+        # Получаем релевантные документы
+        retriever = VECTOR_STORE.as_retriever(search_kwargs={"k": 3})
+        docs = await asyncio.to_thread(retriever.invoke, question)
+        
+        # Формируем цепочку обработки
+        rag_chain = (
+            RunnableParallel({
+                "context": lambda x: format_context(docs),
+                "question": RunnablePassthrough()
+            })
+            | prompt_template
+            | GIGA_CHAT_INSTANCE
+            | StrOutputParser()
+        )
+        
+        # Выполняем асинхронно
+        answer = await asyncio.to_thread(rag_chain.invoke, question)
+        
+        logger.info(f"Запрос обработан за {time.time() - start_time:.2f} сек")
         return {
             "answer": answer,
+            "processing_time": f"{time.time() - start_time:.2f} сек",
             "feedback_request": {
                 "text": "Был ли этот ответ полезен?",
                 "options": ["Да", "Нет"]
             }
         }
     except Exception as e:
-        logger.error(f"Error processing question: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Ошибка обработки запроса: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal Server Error")
 
 @app.post("/feedback")
 async def handle_feedback(
@@ -219,8 +249,8 @@ async def handle_feedback(
                 msg += f" Ваш комментарий: '{comment}'"
             return {"message": msg}
     except Exception as e:
+        logger.error(f"Ошибка обработки feedback: {str(e)}")
         raise HTTPException(status_code=400, detail=str(e))
 
 if __name__ == "__main__":
-    import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
