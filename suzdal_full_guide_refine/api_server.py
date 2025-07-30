@@ -2,6 +2,7 @@ import os
 import requests
 import pandas as pd
 from pathlib import Path
+import logging
 from typing import Optional
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Body
