@@ -73,6 +73,11 @@ def get_gigachat_token():
         'Authorization': f'Basic {GIGACHAT_AUTH}'
     }
     payload = {'scope': 'GIGACHAT_API_PERS'}
+    
+    # Создаем SSL контекст
+    ssl_context = ssl.create_default_context(cafile=CERT_PATH)
+    ssl_context.verify_mode = ssl.CERT_REQUIRED
+    
     try:
         response = requests.post(
             url, 
@@ -92,26 +97,32 @@ def initialize_models():
         access_token = get_gigachat_token()
         logger.info("Токен успешно получен")
         
-        # Создаем SSL контекст один раз
+        # Создаем SSL контекст с нашим сертификатом
         ssl_context = ssl.create_default_context(cafile=CERT_PATH)
+        ssl_context.verify_mode = ssl.CERT_REQUIRED
         
         embedding_model = GigaChatEmbeddings(
             access_token=access_token,
             model="Embeddings",
             scope="GIGACHAT_API_PERS",
-            verify=ssl_context
+            verify_ssl_certs=False,  # Отключаем встроенную проверку
+            ca_bundle_file=CERT_PATH,
+            ssl_context=ssl_context  # Добавляем наш контекст
         )
         
         ai_assistant = GigaChat(
             access_token=access_token,
             model="GigaChat-2",
             temperature=0.2,
-            verify=ssl_context
+            verify_ssl_certs=False,  # Отключаем встроенную проверку
+            ca_bundle_file=CERT_PATH,
+            ssl_context=ssl_context  # Добавляем наш контекст
         )
         
         return embedding_model, ai_assistant
     except Exception as e:
         logger.error(f"Ошибка инициализации: {str(e)}")
+        raiserror(f"Ошибка инициализации: {str(e)}")
         raise
 
 # Инициализация компонентов
@@ -145,6 +156,22 @@ def load_data():
         )
         for _, row in df.iterrows()
     ]
+def setup_certificate():
+    if not Path(CERT_PATH).exists():
+        try:
+            response = requests.get(CERT_URL)
+            response.raise_for_status()
+            with open(CERT_PATH, "wb") as f:
+                f.write(response.content)
+            logger.info("Сертификат успешно скачан")
+            
+            # Проверяем, что сертификат валиден
+            context = ssl.create_default_context()
+            context.load_verify_locations(cafile=CERT_PATH)
+            logger.info("Сертификат успешно верифицирован")
+        except Exception as e:
+            logger.error(f"Не удалось скачать или верифицировать сертификат: {str(e)}")
+            raise
 
 text_documents = load_data()
 vector_store = FAISS.from_documents(text_documents, embedding_model)
