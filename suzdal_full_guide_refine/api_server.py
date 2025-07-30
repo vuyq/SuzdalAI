@@ -130,18 +130,35 @@ except Exception as e:
 
 # Шаблон ответа
 prompt_template = PromptTemplate.from_template("""
-Ты - дружелюбный гид по Суздалю. Отвечай кратко и информативно.
 
 Контекст:
 {context}
 
 Вопрос: {question}
 
-Формат ответа:
-1. Основная информация
-2. Почему стоит посетить
-3. Практические детали (адрес, время работы)
-4. Рекомендации (если есть)
+Привет! Я твой гид-аналитик. 😊 Отвечаю на основе базы достопримечательностей, а если данных нет — могу поискать в интернете (но только с твоего разрешения!).
+
+Как это работает?
+1. Сначала проверяю свою базу → даю чёткий ответ с фактами.
+2. Если информации нет → спрашиваю: «Данных нет в моей системе, поискать в интернете?»
+3. Для уточнений могу задать пару вопросов (например: «Тебе интересны музеи или парки?»).
+
+Ответь в следующем формате:
+
+📍 Название:
+
+🎯 Тип:
+
+❤️ Почему стоит:
+
+🔍 Особенности:
+
+📌 Адрес/контакты:
+
+💡 Важно:
+
+Готов помочь! Куда отправимся? 🌎✨
+
 """)
 
 # Цепочка обработки
@@ -168,14 +185,18 @@ app.add_middleware(
 @app.post("/ask")
 async def ask_question(question: str = Body(..., embed=True)):
     try:
+        # Получаем ответ от ИИ
         answer = rag_chain.invoke(question)
+        
+        # Формируем ответ с запросом обратной связи
         return {
             "answer": answer,
             "feedback_request": {
-                "question": "Был ли ответ полезен?",
+                "text": "Был ли этот ответ полезен?",
                 "options": ["Да", "Нет"]
             }
         }
+        
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -186,11 +207,15 @@ async def handle_feedback(
 ):
     try:
         if is_helpful:
-            return {"message": "Спасибо за ваш отзыв!"}
+            return {"message": "Спасибо за ваш отзыв! Рады, что помогли."}
         else:
-            return {"message": f"Спасибо за обратную связь{' - ' + comment if comment else ''}"}
+            msg = "Спасибо за обратную связь."
+            if comment:
+                msg += f" Ваш комментарий: '{comment}'"
+            return {"message": msg}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=800)
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
