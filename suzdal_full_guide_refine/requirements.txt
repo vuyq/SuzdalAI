@@ -4,6 +4,7 @@ pandas
 requests
 uuid
 python-dotenv
+httpx
 tenacity
 langchain>=0.1.0
 langchain-community
