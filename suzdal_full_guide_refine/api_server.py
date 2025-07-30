@@ -1,5 +1,4 @@
 import os
-import ssl
 import requests
 import pandas as pd
 from pathlib import Path
@@ -12,33 +11,31 @@ from langchain_gigachat import GigaChat, GigaChatEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnableParallel, RunnablePassthrough
+from langchain_core.runnables import RunnableParallel
 from tenacity import retry, stop_after_attempt, wait_exponential
-from langchain_community.tools import DuckDuckGoSearchRun
-from langchain_community.utilities import DuckDuckGoSearchAPIWrapper
+from ddgs import DDGS
 
 # Загрузка переменных окружения
 load_dotenv()
 
 # Конфигурация
-GIGACHAT_AUTH = os.getenv("GIGACHAT_AUTH") 
-CERT_URL = os.getenv("CERT_URL")
-CERT_PATH = os.getenv("CERT_PATH")
-CSV_DATA_URL = "https://raw.githubusercontent.com/vuyq/SuzdalAI/refs/heads/main/suzdal_full_guide_refine/attractions.csv"
-
 class Config:
     MAX_RETRIES = 3
-    MIN_QUESTION_LENGTH = 4  # Минимальное количество слов для вопроса
-    SEARCH_RESULTS = 3  # Количество результатов поиска
-    RETRIEVER_K = 5  # Количество извлекаемых документов
+    MIN_QUESTION_LENGTH = 4
+    SEARCH_RESULTS = 3
+    RETRIEVER_K = 5
+    CERT_PATH = os.getenv("CERT_PATH")
+    CERT_URL = os.getenv("CERT_URL")
+    GIGACHAT_AUTH = os.getenv("GIGACHAT_AUTH")
+    CSV_DATA_URL = "https://raw.githubusercontent.com/vuyq/SuzdalAI/refs/heads/main/suzdal_full_guide_refine/attractions.csv"
 
 # Загрузка сертификата
 def download_certificate():
-    if not Path(CERT_PATH).exists():
+    if not Path(Config.CERT_PATH).exists():
         try:
-            response = requests.get(CERT_URL)
+            response = requests.get(Config.CERT_URL)
             response.raise_for_status()
-            with open(CERT_PATH, "wb") as f:
+            with open(Config.CERT_PATH, "wb") as f:
                 f.write(response.content)
             print("Сертификат успешно скачан")
         except Exception as e:
@@ -47,13 +44,12 @@ def download_certificate():
 @retry(stop=stop_after_attempt(Config.MAX_RETRIES), 
        wait=wait_exponential(multiplier=1, min=2, max=10))
 def get_gigachat_token():
-    """Получение токена для GigaChat с обработкой ошибок"""
     url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
     headers = {
         'Content-Type': 'application/x-www-form-urlencoded',
         'Accept': 'application/json',
         'RqUID': 'a2231e67-570e-47ca-bae8-82ca565850eb',
-        'Authorization': f'Basic {GIGACHAT_AUTH}'
+        'Authorization': f'Basic {Config.GIGACHAT_AUTH}'
     }
     payload = {'scope': 'GIGACHAT_API_PERS'}
     
@@ -62,7 +58,7 @@ def get_gigachat_token():
             url, 
             headers=headers, 
             data=payload, 
-            verify=CERT_PATH,
+            verify=Config.CERT_PATH,
             timeout=10
         )
         response.raise_for_status()
@@ -71,7 +67,6 @@ def get_gigachat_token():
         raise Exception(f"Ошибка при получении токена: {str(e)}")
 
 def initialize_models():
-    """Инициализация моделей GigaChat"""
     try:
         access_token = get_gigachat_token()
         print("Токен успешно получен")
@@ -81,7 +76,7 @@ def initialize_models():
             model="Embeddings",
             scope="GIGACHAT_API_PERS",
             verify_ssl_certs=True,
-            ca_bundle_file=CERT_PATH
+            ca_bundle_file=Config.CERT_PATH
         )
         
         ai_assistant = GigaChat(
@@ -89,7 +84,7 @@ def initialize_models():
             model="GigaChat-2",
             temperature=0,
             verify_ssl_certs=True,
-            ca_bundle_file=CERT_PATH
+            ca_bundle_file=Config.CERT_PATH
         )
         
         return embedding_model, ai_assistant
@@ -98,11 +93,10 @@ def initialize_models():
         raise
 
 def load_data():
-    """Загрузка и подготовка данных"""
     try:
-        df = pd.read_csv(CSV_DATA_URL, sep=';')
+        df = pd.read_csv(Config.CSV_DATA_URL, sep=';')
     except Exception:
-        df = pd.read_csv(CSV_DATA_URL, on_bad_lines='skip')
+        df = pd.read_csv(Config.CSV_DATA_URL, on_bad_lines='skip')
     
     text_documents = [
         Document(
@@ -121,21 +115,75 @@ def load_data():
     ]
     return text_documents
 
-# Инициализация компонентов
-download_certificate()
-embedding_model, ai_assistant = initialize_models()
-text_documents = load_data()
+def perform_web_search(question: str) -> str:
+    try:
+        results = []
+        with DDGS() as ddgs:
+            for r in ddgs.text(f"{question} Суздаль site:ru", max_results=Config.SEARCH_RESULTS):
+                results.append(f"{r['title']}\n{r['href']}\n{r['body']}")
+        return "\n\n".join(results) if results else "Не найдено информации в интернете"
+    except Exception as e:
+        print(f"Ошибка поиска: {e}")
+        return "Не удалось выполнить поиск"
 
-# Создание векторного хранилища
-vector_store = FAISS.from_documents(text_documents, embedding_model)
-document_retriever = vector_store.as_retriever(search_kwargs={"k": Config.RETRIEVER_K})
+def refine_question(question: str) -> str:
+    question_lower = question.lower()
+    words = question.strip().split()
+    
+    food_keywords = ["еда", "поесть", "кафе", "ресторан", "перекусить", "кухня"]
+    if any(keyword in question_lower for keyword in food_keywords) and len(words) < 6:
+        return (
+            "Я могу порекомендовать места по разным критериям:\n"
+            "- По типу кухни (русская, итальянская, азиатская...)\n"
+            "- По расположению (центр, рядом с кремлем...)\n"
+            "- По бюджету (эконом, средний, премиум)\n"
+            "- По атмосфере (уютное, семейное, романтическое...)\n\n"
+            "Что для вас важнее при выборе места?"
+        )
+    
+    if len(words) < Config.MIN_QUESTION_LENGTH:
+        return (
+            "Уточните, пожалуйста, ваш запрос. Например:\n"
+            "- Какие музеи стоит посетить с детьми?\n"
+            "- Где можно попробовать традиционную суздальскую кухню?\n"
+            "- Какие достопримечательности находятся в центре города?\n"
+            "- Где недорого пообедать рядом с Торговыми рядами?"
+        )
+    
+    return None
 
-# Инициализация поисковика
-search = DuckDuckGoSearchRun(
-    api_wrapper=DuckDuckGoSearchAPIWrapper(max_results=Config.SEARCH_RESULTS)
-)
+def format_address(context_docs: list) -> str:
+    if not context_docs:
+        return ""
+    
+    main_doc = context_docs[0]
+    address = main_doc.metadata.get("address", "не указано")
+    
+    if address.lower() in ["не указано", "нет информации", ""]:
+        return ""
+    return address
 
-# Улучшенный промт с более четкой структурой
+def is_answer_in_context(context: list) -> bool:
+    if not context:
+        return False
+    content = "\n".join(doc.page_content for doc in context)
+    return "не указано" not in content and len(content.strip()) > 50
+
+def prepare_prompt_input(question: str, context: list, web_search: str = "") -> dict:
+    address_section = format_address(context)
+    context_str = "\n\n".join([doc.page_content for doc in context]) if context else "Нет данных в базе"
+    
+    return {
+        "context": context_str,
+        "web_search": web_search,
+        "question": question,
+        "address_section": address_section if address_section else "адрес не указан"
+    }
+
+def add_feedback_request(response: str) -> str:
+    feedback_prompt = "\n\nБыл ли этот ответ полезен для вас? Если у вас есть дополнительные вопросы, не стесняйтесь задавать!"
+    return response + feedback_prompt
+
 TOURISM_PROMPT_TEMPLATE = """
 Привет! Я ваш виртуальный гид по Суздалю. Я постараюсь дать максимально полезный и точный ответ.
 
@@ -179,129 +227,80 @@ TOURISM_PROMPT_TEMPLATE = """
 
 tourism_prompt = PromptTemplate.from_template(TOURISM_PROMPT_TEMPLATE)
 
-def format_address(context_docs: list) -> str:
-    """Форматирование адреса с проверкой наличия"""
-    if not context_docs:
-        return ""
+def handle_food_question(question: str) -> str:
+    context = document_retriever.invoke(question)
     
-    main_doc = context_docs[0]
-    address = main_doc.metadata.get("address", "не указано")
+    recommendations = []
+    for doc in context:
+        if doc.metadata.get("type", "").lower() in ["кафе", "ресторан", "столовая"]:
+            name = doc.metadata.get("title", "Заведение")
+            desc = doc.page_content.split("\n")[0][:100] + "..."
+            address = doc.metadata.get("address", "адрес не указан")
+            recommendations.append(f"- {name}: {desc}\n  Адрес: {address}")
     
-    if address.lower() in ["не указано", "нет информации", ""]:
-        return ""
-    return address
-
-def perform_web_search(question: str) -> str:
-    """Выполнение поиска в интернете с обработкой ошибок"""
-    try:
-        search_query = f"site:ru {question} Суздаль"
-        search_results = search.run(search_query)
-        return search_results if search_results else "Не найдено информации в интернете"
-    except Exception as e:
-        print(f"Ошибка при поиске в интернете: {e}")
-        return "Не удалось выполнить поиск в интернете"
-
-def is_answer_in_context(context: list) -> bool:
-    """Проверка наличия полезной информации в контексте"""
-    if not context:
-        return False
-    content = "\n".join(doc.page_content for doc in context)
-    return "не указано" not in content and len(content.strip()) > 50
-
-def prepare_prompt_input(question: str, context: list, web_search: str = "") -> dict:
-    """Подготовка входных данных для промта"""
-    address_section = format_address(context)
-    context_str = "\n\n".join([doc.page_content for doc in context]) if context else "Нет данных в базе"
-    
-    return {
-        "context": context_str,
-        "web_search": web_search,
-        "question": question,
-        "address_section": address_section if address_section else "адрес не указан"
-    }
-
-def add_feedback_request(response: str) -> str:
-    """Добавление запроса обратной связи к ответу"""
-    feedback_prompt = "\n\nБыл ли этот ответ полезен для вас? Если у вас есть дополнительные вопросы, не стесняйтесь задавать!"
-    return response + feedback_prompt
-
-def refine_question(question: str) -> str:
-    """Уточнение слишком общего вопроса"""
-    words = question.strip().split()
-    if len(words) < Config.MIN_QUESTION_LENGTH:
-        clarification_examples = [
-            "- Конкретное место (например, 'Суздальский кремль')",
-            "- Тип достопримечательности (музеи, храмы, рестораны)",
-            "- Интересы (история, архитектура, активный отдых)"
-        ]
-        examples = "\n".join(clarification_examples)
-        return (
-            f"Ваш вопрос довольно общий: '{question}'. Чтобы я мог дать более точный ответ, "
-            f"уточните, пожалуйста, что именно вас интересует. Например:\n{examples}\n"
-            "Можете задать вопрос более подробно?"
+    if recommendations:
+        response = (
+            "Вот несколько вариантов где можно поесть в Суздале:\n\n"
+            + "\n\n".join(recommendations[:5]) +
+            "\n\nМогу уточнить рекомендации по конкретным критериям - просто скажите, что для вас важно!"
         )
-    return None
+    else:
+        web_results = perform_web_search(question)
+        if "Не найдено" not in web_results:
+            response = f"Вот что я нашел в интернете:\n{web_results}"
+        else:
+            response = (
+                "К сожалению, не нашел конкретных рекомендаций. "
+                "Попробуйте уточнить:\n"
+                "- Какую кухню предпочитаете?\n"
+                "- В каком районе ищете заведение?\n"
+                "- Какой уровень цен вас интересует?"
+            )
+    
+    return add_feedback_request(response)
 
-rag_pipeline = (
-    RunnableParallel(
-        {
-            "context": lambda x: document_retriever.invoke(x["question"]),
-            "web_search": lambda x: perform_web_search(x["question"]),
-            "question": lambda x: x["question"]
-        }
-    )
-    | (lambda x: prepare_prompt_input(x["question"], x["context"], x["web_search"]))
-    | tourism_prompt
-    | ai_assistant
-    | StrOutputParser()
-    | add_feedback_request
-)
+def handle_general_question(question: str) -> str:
+    context = document_retriever.invoke(question)
+    
+    if is_answer_in_context(context):
+        prompt_input = prepare_prompt_input(question, context)
+        response = ai_assistant.invoke(tourism_prompt.format(**prompt_input))
+    else:
+        web_results = perform_web_search(question)
+        if "Не найдено" not in web_results:
+            prompt_input = prepare_prompt_input(question, [], web_results)
+            response = ai_assistant.invoke(tourism_prompt.format(**prompt_input))
+        else:
+            response = "К сожалению, не удалось найти информацию. Попробуйте переформулировать вопрос."
+    
+    return add_feedback_request(response)
 
 def ask_question(question: str) -> str:
-    """Основная функция обработки вопроса"""
-    # Проверка на пустой вопрос
     if not question.strip():
         return "Пожалуйста, задайте ваш вопрос о Суздале. Я постараюсь помочь!"
+
+    food_keywords = ["еда", "поесть", "кафе", "ресторан", "перекусить", "кухня"]
+    is_food_question = any(keyword in question.lower() for keyword in food_keywords)
     
-    # Уточнение слишком общего вопроса
     refinement = refine_question(question)
     if refinement:
         return refinement
     
-    # Поиск в локальной базе
-    context = document_retriever.invoke(question)
+    if is_food_question:
+        return handle_food_question(question)
     
-    if is_answer_in_context(context):
-        try:
-            response = rag_pipeline.invoke({"question": question})
-            return response
-        except Exception as e:
-            print(f"Ошибка при обработке вопроса: {e}")
-            return "Произошла ошибка при обработке вашего вопроса. Пожалуйста, попробуйте позже."
-    else:
-        # Поиск в интернете, если в базе нет информации
-        web_results = perform_web_search(question)
-        if "Не найдено" not in web_results:
-            try:
-                response = rag_pipeline.invoke({
-                    "question": question,
-                    "context": [],
-                    "web_search": web_results
-                })
-                return response
-            except Exception as e:
-                print(f"Ошибка при обработке веб-результатов: {e}")
-        
-        # Если информация не найдена нигде
-        return (
-            "К сожалению, мне не удалось найти информацию по вашему запросу. "
-            "Можете попробовать переформулировать вопрос или уточнить детали. "
-            "Также я могу предложить общую информацию о Суздале или популярные достопримечательности."
-        )
+    return handle_general_question(question)
+
+# Инициализация компонентов
+download_certificate()
+embedding_model, ai_assistant = initialize_models()
+text_documents = load_data()
+vector_store = FAISS.from_documents(text_documents, embedding_model)
+document_retriever = vector_store.as_retriever(search_kwargs={"k": Config.RETRIEVER_K})
 
 # FastAPI приложение
-app = FastAPI(title="Suздаль Tourism Assistant", 
-              description="AI помощник по туризму в Суздале")
+app = FastAPI(title="Суздаль Tourism Assistant", 
+             description="AI помощник по туризму в Суздале")
 
 app.add_middleware(
     CORSMiddleware,
