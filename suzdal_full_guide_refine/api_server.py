@@ -19,6 +19,24 @@ from langchain_core.runnables import RunnableParallel, RunnablePassthrough
 from tenacity import retry, stop_after_attempt, wait_exponential
 from langchain_community.tools import DuckDuckGoSearchRun
 from langchain_community.utilities import DuckDuckGoSearchAPIWrapper
+import os
+import logging
+import asyncio
+import time
+import requests
+import pandas as pd
+from pathlib import Path
+from typing import Optional
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Body
+from fastapi.middleware.cors import CORSMiddleware
+from langchain_core.documents import Document
+from langchain_gigachat import GigaChat, GigaChatEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_core.prompts import PromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnableParallel, RunnablePassthrough
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 # Настройка логгирования
 logging.basicConfig(
@@ -38,7 +56,7 @@ CERT_PATH = os.getenv("CERT_PATH")
 # Глобальные переменные для кэширования
 GIGA_CHAT_INSTANCE = None
 VECTOR_STORE = None
-SEARCH_TOOL = None
+RETRIEVER = None
 
 # Скачивание сертификата
 if not Path(CERT_PATH).exists():
@@ -112,8 +130,8 @@ def create_vector_store(df):
             metadata={
                 "title": row.get("Name", ""),
                 "type": row.get("Type", ""),
-                "tags": row.get("Tags", ""),
-                "address": row.get("Address", "не указано")
+                "address": row.get("Address", "не указано"),
+                "description": row.get("Description", "")
             }
         )
         for _, row in df.iterrows()
@@ -130,72 +148,9 @@ def create_vector_store(df):
     
     return FAISS.from_documents(documents, embeddings)
 
-# Шаблон ответа на русском языке
-# Исправленный шаблон промпта
-prompt_template = PromptTemplate.from_template("""
-Ты - гид по Суздалю. Отвечай только на русском языке. На вопрос: {question}
-
-Найдены следующие достопримечательности:
-{context}
-
-Сформируй развернутый ответ, включив ВСЕ подходящие варианты. Для каждого места укажи:
-
-📍 {title}
-{type}
-[краткое описание уникальных особенностей]
-[интересные детали и исторические факты]
-📌 {address}
-💡 Важно: [практическая информация или советы]
-
-Если вариантов несколько - разделяй их пустой строкой.
-""")
-
-# Обновленная функция format_context
-def format_context(docs):
-    formatted_docs = []
-    for doc in docs:
-        # Извлекаем описание из page_content
-        description = next(
-            (line.split(":", 1)[1].strip() 
-             for line in doc.page_content.split("\n") 
-             if line.startswith("Description:")),
-            doc.page_content[:200] + ("..." if len(doc.page_content) > 200 else "")
-        )
-        
-        formatted_docs.append({
-            "title": doc.metadata.get("title", "Неизвестно"),
-            "type": doc.metadata.get("type", "Неизвестно"),
-            "address": doc.metadata.get("address", "Не указан"),
-            "description": description
-        })
-    return formatted_docs
-
-# Обновленная цепочка обработки
-rag_chain = (
-    RunnableParallel({
-        "context": retriever | format_context,
-        "question": RunnablePassthrough()
-    })
-    | {
-        "context": lambda x: "\n\n".join(
-            f"Название: {item['title']}\n"
-            f"Тип: {item['type']}\n"
-            f"Адрес: {item['address']}\n"
-            f"Описание: {item['description']}"
-            for item in x["context"]
-        ),
-        "question": lambda x: x["question"],
-        "title": lambda x: x["context"][0]["title"] if x["context"] else "Неизвестно",
-        "type": lambda x: x["context"][0]["type"] if x["context"] else "Неизвестно",
-        "address": lambda x: x["context"][0]["address"] if x["context"] else "Не указан"
-    }
-    | prompt_template
-    | GIGA_CHAT_INSTANCE
-    | StrOutputParser()
-)
-# Инициализация сервисов при старте приложения
+# Инициализация сервисов
 async def initialize_services():
-    global GIGA_CHAT_INSTANCE, VECTOR_STORE, SEARCH_TOOL
+    global GIGA_CHAT_INSTANCE, VECTOR_STORE, RETRIEVER
     
     try:
         # Инициализация GigaChat
@@ -206,17 +161,60 @@ async def initialize_services():
         if VECTOR_STORE is None:
             df = load_attractions_data()
             VECTOR_STORE = create_vector_store(df)
-        
-        # Инициализация поискового инструмента
-        if SEARCH_TOOL is None:
-            SEARCH_TOOL = DuckDuckGoSearchRun(
-                api_wrapper=DuckDuckGoSearchAPIWrapper(max_results=2)
-            )
+            RETRIEVER = VECTOR_STORE.as_retriever(search_kwargs={"k": 3})
         
         logger.info("Все сервисы успешно инициализированы")
     except Exception as e:
         logger.error(f"Ошибка инициализации сервисов: {str(e)}")
         raise
+
+prompt_template = PromptTemplate.from_template("""
+Ты - профессиональный гид-экскурсовод по городу Суздаль. Отвечай ТОЛЬКО на русском языке в дружелюбном и информативном стиле.
+
+Текущий запрос пользователя: 
+{question}
+
+Найдены подходящие достопримечательности:
+{context}
+
+Сформируй ИСЧЕРПЫВАЮЩИЙ ответ по следующей структуре:
+
+1. 📍 Название: {title}
+2. 🏛 Тип: {type} 
+3. 🗺 Адрес: {address}
+4. ❤️ Почему стоит посетить: {description}
+5. 🔍 Интересные факты: [приведи 2-3 уникальных факта]
+6. ⏰ Часы работы: [укажи если есть в данных]
+7. 💰 Стоимость: [укажи билеты если есть информация]
+8. 💡 Советы посетителям: [практические рекомендации]
+9. 🚶 Как добраться: [кратко опиши маршрут от центра]
+
+Если вариантов несколько - разделяй их 2 пустыми строками для лучшей читаемости.
+
+После ответа ЗАДАЙ 2 УТОЧНЯЮЩИХ ВОПРОСА для уточнения потребностей пользователя (например: 
+"Вас интересуют больше музеи или храмы?" 
+"Планируете посещение с детьми?")
+
+В конце добавь призыв к обратной связи:
+"Был ли полезен мой ответ? Нам важно ваше мнение для улучшения сервиса!"
+
+Сохраняй ДОБРОЖЕЛАТЕЛЬНЫЙ ТОН и ПРОФЕССИОНАЛИЗМ. Избегай сухого перечисления фактов - делай ответ живым и увлекательным!
+""")
+
+# Форматирование контекста
+def format_context(docs):
+    if not docs:
+        return "Не найдено подходящих достопримечательностей"
+    
+    formatted = []
+    for doc in docs:
+        formatted.append(
+            f"Название: {doc.metadata.get('title', 'Неизвестно')}\n"
+            f"Тип: {doc.metadata.get('type', 'Неизвестно')}\n"
+            f"Адрес: {doc.metadata.get('address', 'Не указан')}\n"
+            f"Описание: {doc.metadata.get('description', doc.page_content[:200])}"
+        )
+    return "\n\n".join(formatted)
 
 # FastAPI приложение
 app = FastAPI()
@@ -238,42 +236,99 @@ async def ask_question(question: str = Body(..., embed=True)):
     try:
         start_time = time.time()
         
-        if not question.strip():
-            raise HTTPException(status_code=400, detail="Question cannot be empty")
-            
-        answer = await asyncio.to_thread(rag_chain.invoke, question)
+        # Валидация входящего запроса
+        question = question.strip()
+        if not question:
+            raise HTTPException(
+                status_code=400,
+                detail="Пожалуйста, задайте вопрос о достопримечательностях Суздаля"
+            )
         
-        logger.info(f"Request processed in {time.time() - start_time:.2f} seconds")
+        logger.info(f"Обработка вопроса: '{question}'")
+        
+        # Асинхронное получение релевантных документов
+        docs = await asyncio.to_thread(
+            RETRIEVER.invoke,
+            question,
+            config={"max_concurrency": 5}
+        )
+        
+        # Форматирование контекста с обработкой пустого результата
+        context = format_context(docs) if docs else "Не найдено подходящих достопримечательностей"
+        
+        # Подготовка данных для промпта
+        input_data = {
+            "context": context,
+            "question": question,
+            "title": docs[0].metadata["title"] if docs else "Неизвестно",
+            "type": docs[0].metadata.get("type", "Неизвестно") if docs else "Неизвестно",
+            "address": docs[0].metadata.get("address", "Не указан") if docs else "Не указан",
+            "description": docs[0].metadata.get("description", "") if docs else ""
+        }
+        
+        # Создание цепочки обработки с обработкой ошибок
+        try:
+            answer = await asyncio.wait_for(
+                asyncio.to_thread(
+                    RunnableParallel({
+                        "context": lambda x: x["context"],
+                        "question": RunnablePassthrough(),
+                        **{k: lambda x, key=k: x[key] for k in ["title", "type", "address", "description"]}
+                    })
+                    | create_prompt_template()
+                    | GIGA_CHAT_INSTANCE
+                    | StrOutputParser()
+                    .invoke,
+                    input_data
+                ),
+                timeout=30.0
+            )
+        except asyncio.TimeoutError:
+            raise HTTPException(
+                status_code=504,
+                detail="Превышено время ожидания ответа. Пожалуйста, попробуйте позже."
+            )
+        
+        # Логирование и возврат результата
+        processing_time = time.time() - start_time
+        logger.info(
+            f"Успешно обработан вопрос за {processing_time:.2f} сек: "
+            f"'{question[:50]}...'"
+        )
+        
         return {
             "answer": answer,
-            "processing_time": f"{time.time() - start_time:.2f} seconds"
+            "processing_time": f"{processing_time:.2f} сек",
+            "suggested_questions": [
+                "Какие ещё достопримечательности вас интересуют?",
+                "Нужна ли информация о времени работы или стоимости билетов?"
+            ],
+            "request_feedback": True
         }
-    
+        
     except HTTPException:
-        raise
+        raise  # Пробрасываем уже обработанные HTTP исключения
+        
     except Exception as e:
-        logger.error(f"Error processing question: {str(e)}", exc_info=True)
+        logger.error(
+            f"Ошибка при обработке вопроса '{question}': {str(e)}",
+            exc_info=True
+        )
         raise HTTPException(
             status_code=500,
-            detail="An error occurred while processing your request"
+            detail="Произошла ошибка при обработке вашего запроса. Пожалуйста, попробуйте ещё раз."
         )
 
 @app.post("/feedback")
-async def handle_feedback(
+async def collect_feedback(
     is_helpful: bool = Body(...),
-    comment: Optional[str] = Body(None)
+    comment: str = Body(None),
+    question: str = Body(...)
 ):
-    try:
-        if is_helpful:
-            return {"message": "Спасибо за ваш отзыв! Рады, что помогли."}
-        else:
-            msg = "Спасибо за обратную связь."
-            if comment:
-                msg += f" Ваш комментарий: '{comment}'"
-            return {"message": msg}
-    except Exception as e:
-        logger.error(f"Ошибка обработки feedback: {str(e)}")
-        raise HTTPException(status_code=400, detail=str(e))
+    # Логируем feedback для анализа
+    logger.info(f"Feedback: helpful={is_helpful}, comment={comment}, question={question}")
+    return {"message": "Спасибо за ваш отзыв!"}
 
 if __name__ == "__main__":
+    import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
