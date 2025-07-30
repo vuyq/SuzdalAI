@@ -131,6 +131,7 @@ def create_vector_store(df):
     return FAISS.from_documents(documents, embeddings)
 
 # Шаблон ответа на русском языке
+# Исправленный шаблон промпта
 prompt_template = PromptTemplate.from_template("""
 Ты - гид по Суздалю. Отвечай только на русском языке. На вопрос: {question}
 
@@ -139,26 +140,59 @@ prompt_template = PromptTemplate.from_template("""
 
 Сформируй развернутый ответ, включив ВСЕ подходящие варианты. Для каждого места укажи:
 
-📍 {название из metadata}
-{type из metadata}
+📍 {title}
+{type}
 [краткое описание уникальных особенностей]
 [интересные детали и исторические факты]
-{address из metadata}
+📌 {address}
 💡 Важно: [практическая информация или советы]
 
 Если вариантов несколько - разделяй их пустой строкой.
 """)
 
-# Оптимизированная функция форматирования контекста
+# Обновленная функция format_context
 def format_context(docs):
-    return "\n\n".join(
-        f"Название: {doc.metadata['title']}\n"
-        f"Тип: {doc.metadata['type']}\n"
-        f"Адрес: {doc.metadata.get('address', 'не указан')}\n"
-        f"Описание: {doc.page_content[:200]}{'...' if len(doc.page_content) > 200 else ''}"
-        for doc in docs
-    )
+    formatted_docs = []
+    for doc in docs:
+        # Извлекаем описание из page_content
+        description = next(
+            (line.split(":", 1)[1].strip() 
+             for line in doc.page_content.split("\n") 
+             if line.startswith("Description:")),
+            doc.page_content[:200] + ("..." if len(doc.page_content) > 200 else "")
+        )
+        
+        formatted_docs.append({
+            "title": doc.metadata.get("title", "Неизвестно"),
+            "type": doc.metadata.get("type", "Неизвестно"),
+            "address": doc.metadata.get("address", "Не указан"),
+            "description": description
+        })
+    return formatted_docs
 
+# Обновленная цепочка обработки
+rag_chain = (
+    RunnableParallel({
+        "context": retriever | format_context,
+        "question": RunnablePassthrough()
+    })
+    | {
+        "context": lambda x: "\n\n".join(
+            f"Название: {item['title']}\n"
+            f"Тип: {item['type']}\n"
+            f"Адрес: {item['address']}\n"
+            f"Описание: {item['description']}"
+            for item in x["context"]
+        ),
+        "question": lambda x: x["question"],
+        "title": lambda x: x["context"][0]["title"] if x["context"] else "Неизвестно",
+        "type": lambda x: x["context"][0]["type"] if x["context"] else "Неизвестно",
+        "address": lambda x: x["context"][0]["address"] if x["context"] else "Не указан"
+    }
+    | prompt_template
+    | GIGA_CHAT_INSTANCE
+    | StrOutputParser()
+)
 # Инициализация сервисов при старте приложения
 async def initialize_services():
     global GIGA_CHAT_INSTANCE, VECTOR_STORE, SEARCH_TOOL
@@ -204,36 +238,25 @@ async def ask_question(question: str = Body(..., embed=True)):
     try:
         start_time = time.time()
         
-        # Получаем релевантные документы
-        retriever = VECTOR_STORE.as_retriever(search_kwargs={"k": 3})
-        docs = await asyncio.to_thread(retriever.invoke, question)
-        
-        # Формируем цепочку обработки
-        rag_chain = (
-            RunnableParallel({
-                "context": lambda x: format_context(docs),
-                "question": RunnablePassthrough()
-            })
-            | prompt_template
-            | GIGA_CHAT_INSTANCE
-            | StrOutputParser()
-        )
-        
-        # Выполняем асинхронно
+        if not question.strip():
+            raise HTTPException(status_code=400, detail="Question cannot be empty")
+            
         answer = await asyncio.to_thread(rag_chain.invoke, question)
         
-        logger.info(f"Запрос обработан за {time.time() - start_time:.2f} сек")
+        logger.info(f"Request processed in {time.time() - start_time:.2f} seconds")
         return {
             "answer": answer,
-            "processing_time": f"{time.time() - start_time:.2f} сек",
-            "feedback_request": {
-                "text": "Был ли этот ответ полезен?",
-                "options": ["Да", "Нет"]
-            }
+            "processing_time": f"{time.time() - start_time:.2f} seconds"
         }
+    
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Ошибка обработки запроса: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal Server Error")
+        logger.error(f"Error processing question: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail="An error occurred while processing your request"
+        )
 
 @app.post("/feedback")
 async def handle_feedback(
