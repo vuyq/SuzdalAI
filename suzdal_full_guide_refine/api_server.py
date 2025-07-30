@@ -3,27 +3,6 @@ import logging
 import asyncio
 import time
 import requests
-import uvicorn
-import pandas as pd
-from pathlib import Path
-from typing import Optional
-from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Body, Request
-from fastapi.middleware.cors import CORSMiddleware
-from langchain_core.documents import Document
-from langchain_gigachat import GigaChat, GigaChatEmbeddings
-from langchain_community.vectorstores import FAISS
-from langchain_core.prompts import PromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnableParallel, RunnablePassthrough
-from tenacity import retry, stop_after_attempt, wait_exponential
-from langchain_community.tools import DuckDuckGoSearchRun
-from langchain_community.utilities import DuckDuckGoSearchAPIWrapper
-import os
-import logging
-import asyncio
-import time
-import requests
 import pandas as pd
 from pathlib import Path
 from typing import Optional
