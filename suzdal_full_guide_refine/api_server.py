@@ -1,7 +1,6 @@
 import os
 import requests
 import pandas as pd
-import uvicorn
 from pathlib import Path
 from typing import Optional
 from dotenv import load_dotenv
@@ -87,7 +86,7 @@ def load_attractions_data():
     csv_url = "https://raw.githubusercontent.com/vuyq/SuzdalAI/main/suzdal_full_guide_refine/attractions.csv"
     try:
         df = pd.read_csv(csv_url, sep=';')
-        print("Данные о достопримечательностях загружены")
+        print(f"Загружено {len(df)} достопримечательностей")
         return df
     except Exception as e:
         print(f"Ошибка загрузки данных: {str(e)}")
@@ -110,6 +109,7 @@ def create_vector_store(df):
         )
         for _, row in df.iterrows()
     ]
+    print(f"Создано {len(documents)} документов для векторного поиска")
     return FAISS.from_documents(documents, GigaChatEmbeddings(
         access_token=get_gigachat_token(),
         model="Embeddings",
@@ -128,43 +128,44 @@ except Exception as e:
     print(f"Ошибка инициализации данных: {str(e)}")
     raise
 
-# Шаблон ответа
+# Шаблон ответа на русском языке
 prompt_template = PromptTemplate.from_template("""
+Ты - гид по Суздалю. Отвечай только на русском языке. На вопрос: {question}
 
-Контекст:
+Найдены следующие достопримечательности:
 {context}
 
-Вопрос: {question}
+Сформируй развернутый ответ, включив ВСЕ подходящие варианты. Для каждого места укажи:
 
-Привет! Я твой гид-аналитик. 😊 Отвечаю на основе базы достопримечательностей, а если данных нет — могу поискать в интернете (но только с твоего разрешения!).
+📍 Название: {название из metadata}
+🎯 Тип: {type из metadata}
+❤️ Почему стоит посетить: [краткое описание уникальных особенностей]
+🔍 Особенности: [интересные детали и исторические факты]
+📌 Адрес: {address из metadata}
+💡 Важно: [практическая информация или советы]
 
-Как это работает?
-1. Сначала проверяю свою базу → даю чёткий ответ с фактами.
-2. Если информации нет → спрашиваю: «Данных нет в моей системе, поискать в интернете?»
-3. Для уточнений могу задать пару вопросов (например: «Тебе интересны музеи или парки?»).
-
-Ответь в следующем формате:
-
-📍 Название:
-
-🎯 Тип:
-
-❤️ Почему стоит:
-
-🔍 Особенности:
-
-📌 Адрес/контакты:
-
-💡 Важно:
-
-Готов помочь! Куда отправимся? 🌎✨
-
+Если вариантов несколько - разделяй их пустой строкой.
 """)
+
+# Форматирование контекста
+def format_context(docs):
+    formatted = []
+    for doc in docs:
+        content_lines = doc.page_content.split('\n')
+        description = next((line.split(':')[1].strip() for line in content_lines if line.startswith('Description:')), "не указано")[0]
+        
+        formatted.append(
+            f"Название: {doc.metadata['title']}\n"
+            f"Тип: {doc.metadata['type']}\n"
+            f"Адрес: {doc.metadata.get('address', 'не указан')}\n"
+            f"Описание: {description[:200]}{'...' if len(description) > 200 else ''}"
+        )
+    return "\n\n".join(formatted)
 
 # Цепочка обработки
 rag_chain = (
     RunnableParallel({
-        "context": retriever,
+        "context": retriever | format_context,
         "question": RunnablePassthrough()
     })
     | prompt_template
@@ -185,10 +186,7 @@ app.add_middleware(
 @app.post("/ask")
 async def ask_question(question: str = Body(..., embed=True)):
     try:
-        # Получаем ответ от ИИ
         answer = rag_chain.invoke(question)
-        
-        # Формируем ответ с запросом обратной связи
         return {
             "answer": answer,
             "feedback_request": {
@@ -196,7 +194,6 @@ async def ask_question(question: str = Body(..., embed=True)):
                 "options": ["Да", "Нет"]
             }
         }
-        
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
