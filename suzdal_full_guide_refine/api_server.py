@@ -134,7 +134,7 @@ def load_data():
                 "title": row.get("Name", ""),
                 "type": row.get("Type", ""),
                 "tags": row.get("Tags", ""),
-                "address": row.get("Address", "не указано")
+                "address": row.get("Address", "не указан")
             }
         )
         for _, row in df.iterrows()
@@ -186,47 +186,14 @@ def refine_question(question: str, session_id: str) -> str:
     
     return None
 
-def ask_question(question: str, session_id: str) -> str:
-    if not question.strip():
-        return "Пожалуйста, задайте ваш вопрос о Суздале. Я постараюсь помочь!"
-
-    # Добавляем вопрос пользователя в историю
-    dialog_history.add_message(session_id, "user", question)
-    
-    # Проверяем, является ли это ответом на уточняющий вопрос
-    history = dialog_history.get_history(session_id)
-    if history and len(history) >= 2:
-        last_assistant_msg = history[-2]["content"] if history[-2]["role"] == "assistant" else ""
-        if "уточните" in last_assistant_msg.lower():
-            # Если это ответ на уточняющий вопрос - обрабатываем как обычный запрос
-            food_keywords = ["еда", "поесть", "кафе", "ресторан", "перекусить", "кухня"]
-            is_food_question = any(keyword in question.lower() for keyword in food_keywords)
-            
-            if is_food_question:
-                return handle_food_question(question, session_id)
-            return handle_general_question(question, session_id)
-    
-    # Стандартная обработка
-    refinement = refine_question(question, session_id)
-    if refinement:
-        dialog_history.add_message(session_id, "assistant", refinement)
-        return refinement
-    
-    food_keywords = ["еда", "поесть", "кафе", "ресторан", "перекусить", "кухня"]
-    is_food_question = any(keyword in question.lower() for keyword in food_keywords)
-    
-    if is_food_question:
-        return handle_food_question(question, session_id)
-    
-    return handle_general_question(question, session_id)
 def format_address(context_docs: list) -> str:
     if not context_docs:
         return ""
     
     main_doc = context_docs[0]
-    address = main_doc.metadata.get("address", "не указано")
+    address = main_doc.metadata.get("address", "не указан")
     
-    if address.lower() in ["не указано", "нет информации", ""]:
+    if address.lower() in ["не указан", "нет информации", ""]:
         return ""
     return address
 
@@ -306,6 +273,9 @@ TOURISM_PROMPT_TEMPLATE = """
 tourism_prompt = PromptTemplate.from_template(TOURISM_PROMPT_TEMPLATE)
 
 def handle_food_question(question: str, session_id: str) -> str:
+    if not hasattr(document_retriever, 'invoke'):
+        return "Сервис временно недоступен. Пожалуйста, попробуйте позже."
+        
     context = document_retriever.invoke(question)
     
     recommendations = []
@@ -339,11 +309,16 @@ def handle_food_question(question: str, session_id: str) -> str:
     return add_feedback_request(response)
 
 def handle_general_question(question: str, session_id: str) -> str:
+    if not hasattr(document_retriever, 'invoke'):
+        return "Сервис временно недоступен. Пожалуйста, попробуйте позже."
+        
     context = document_retriever.invoke(question)
     history = dialog_history.get_history(session_id)
     
     if is_answer_in_context(context):
         prompt_input = prepare_prompt_input(question, context, history=history)
+        if not hasattr(ai_assistant, 'invoke'):
+            return "Сервис временно недоступен. Пожалуйста, попробуйте позже."
         response = ai_assistant.invoke(tourism_prompt.format(**prompt_input))
     else:
         web_results = perform_web_search(question)
@@ -360,15 +335,30 @@ def ask_question(question: str, session_id: str) -> str:
     if not question.strip():
         return "Пожалуйста, задайте ваш вопрос о Суздале. Я постараюсь помочь!"
 
+    # Добавляем вопрос пользователя в историю
     dialog_history.add_message(session_id, "user", question)
     
-    food_keywords = ["еда", "поесть", "кафе", "ресторан", "перекусить", "кухня"]
-    is_food_question = any(keyword in question.lower() for keyword in food_keywords)
+    # Проверяем, является ли это ответом на уточняющий вопрос
+    history = dialog_history.get_history(session_id)
+    if history and len(history) >= 2:
+        last_assistant_msg = history[-2]["content"] if history[-2]["role"] == "assistant" else ""
+        if "уточните" in last_assistant_msg.lower():
+            # Если это ответ на уточняющий вопрос - обрабатываем как обычный запрос
+            food_keywords = ["еда", "поесть", "кафе", "ресторан", "перекусить", "кухня"]
+            is_food_question = any(keyword in question.lower() for keyword in food_keywords)
+            
+            if is_food_question:
+                return handle_food_question(question, session_id)
+            return handle_general_question(question, session_id)
     
-    refinement = refine_question(question)
+    # Стандартная обработка
+    refinement = refine_question(question, session_id)
     if refinement:
         dialog_history.add_message(session_id, "assistant", refinement)
         return refinement
+    
+    food_keywords = ["еда", "поесть", "кафе", "ресторан", "перекусить", "кухня"]
+    is_food_question = any(keyword in question.lower() for keyword in food_keywords)
     
     if is_food_question:
         return handle_food_question(question, session_id)
