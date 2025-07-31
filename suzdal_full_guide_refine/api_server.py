@@ -31,7 +31,7 @@ class Config:
     CERT_URL = os.getenv("CERT_URL")
     GIGACHAT_AUTH = os.getenv("GIGACHAT_AUTH")
     CSV_DATA_URL = "https://raw.githubusercontent.com/vuyq/SuzdalAI/refs/heads/main/suzdal_full_guide_refine/attractions.csv"
-    MAX_HISTORY_LENGTH = 5  # Максимальное количество запоминаемых сообщений
+    MAX_HISTORY_LENGTH = 40  # Максимальное количество запоминаемых сообщений
 
 # Система хранения истории диалогов
 class DialogHistory:
