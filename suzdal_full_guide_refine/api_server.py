@@ -401,14 +401,40 @@ class Question(BaseModel):
 @app.post("/ask")
 async def ask(item: Question):
     try:
+        # Проверяем инициализацию моделей
+        if not ai_assistant or not document_retriever:
+            raise HTTPException(status_code=503, detail="Service not initialized")
+
         # Создаем новую сессию, если не передана
         if not item.session_id:
             item.session_id = dialog_history.create_session()
         
-        response = ask_question(item.question, item.session_id)
-        return {"answer": response, "session_id": item.session_id}
+        # Проверяем наличие вопроса
+        if not item.question or not item.question.strip():
+            raise HTTPException(status_code=400, detail="Question cannot be empty")
+        
+        try:
+            response = ask_question(item.question, item.session_id)
+            return {
+                "answer": response,
+                "session_id": item.session_id
+            }
+        except Exception as e:
+            # Логируем ошибку для отладки
+            print(f"Error processing question: {str(e)}")
+            raise HTTPException(
+                status_code=500,
+                detail="Error processing your question. Please try again."
+            )
+            
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Unexpected error: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail="Internal server error"
+        )
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8001)
