@@ -152,9 +152,17 @@ def perform_web_search(question: str) -> str:
         print(f"Ошибка поиска: {e}")
         return "Не удалось выполнить поиск"
 
-def refine_question(question: str) -> str:
+def refine_question(question: str, session_id: str) -> str:
     question_lower = question.lower()
     words = question.strip().split()
+    
+    # Получаем историю диалога
+    history = dialog_history.get_history(session_id)
+    
+    # Проверяем, был ли предыдущий ответ уточняющим вопросом
+    if history and history[-1]["role"] == "assistant" and "уточните" in history[-1]["content"].lower():
+        # Если это ответ на уточняющий вопрос - пропускаем уточнение
+        return None
     
     food_keywords = ["еда", "поесть", "кафе", "ресторан", "перекусить", "кухня"]
     if any(keyword in question_lower for keyword in food_keywords) and len(words) < 6:
@@ -178,6 +186,39 @@ def refine_question(question: str) -> str:
     
     return None
 
+def ask_question(question: str, session_id: str) -> str:
+    if not question.strip():
+        return "Пожалуйста, задайте ваш вопрос о Суздале. Я постараюсь помочь!"
+
+    # Добавляем вопрос пользователя в историю
+    dialog_history.add_message(session_id, "user", question)
+    
+    # Проверяем, является ли это ответом на уточняющий вопрос
+    history = dialog_history.get_history(session_id)
+    if history and len(history) >= 2:
+        last_assistant_msg = history[-2]["content"] if history[-2]["role"] == "assistant" else ""
+        if "уточните" in last_assistant_msg.lower():
+            # Если это ответ на уточняющий вопрос - обрабатываем как обычный запрос
+            food_keywords = ["еда", "поесть", "кафе", "ресторан", "перекусить", "кухня"]
+            is_food_question = any(keyword in question.lower() for keyword in food_keywords)
+            
+            if is_food_question:
+                return handle_food_question(question, session_id)
+            return handle_general_question(question, session_id)
+    
+    # Стандартная обработка
+    refinement = refine_question(question, session_id)
+    if refinement:
+        dialog_history.add_message(session_id, "assistant", refinement)
+        return refinement
+    
+    food_keywords = ["еда", "поесть", "кафе", "ресторан", "перекусить", "кухня"]
+    is_food_question = any(keyword in question.lower() for keyword in food_keywords)
+    
+    if is_food_question:
+        return handle_food_question(question, session_id)
+    
+    return handle_general_question(question, session_id)
 def format_address(context_docs: list) -> str:
     if not context_docs:
         return ""
