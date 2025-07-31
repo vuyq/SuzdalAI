@@ -1,6 +1,7 @@
 import os
 import requests
 import pandas as pd
+import uvicorn
 from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -14,6 +15,8 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnableParallel
 from tenacity import retry, stop_after_attempt, wait_exponential
 from ddgs import DDGS
+from typing import Dict, List
+from uuid import uuid4
 
 # Загрузка переменных окружения
 load_dotenv()
@@ -28,6 +31,29 @@ class Config:
     CERT_URL = os.getenv("CERT_URL")
     GIGACHAT_AUTH = os.getenv("GIGACHAT_AUTH")
     CSV_DATA_URL = "https://raw.githubusercontent.com/vuyq/SuzdalAI/refs/heads/main/suzdal_full_guide_refine/attractions.csv"
+    MAX_HISTORY_LENGTH = 5  # Максимальное количество запоминаемых сообщений
+
+# Система хранения истории диалогов
+class DialogHistory:
+    def __init__(self):
+        self.sessions: Dict[str, List[Dict]] = {}
+    
+    def create_session(self) -> str:
+        session_id = str(uuid4())
+        self.sessions[session_id] = []
+        return session_id
+    
+    def add_message(self, session_id: str, role: str, content: str):
+        if session_id in self.sessions:
+            self.sessions[session_id].append({"role": role, "content": content})
+            # Ограничиваем длину истории
+            if len(self.sessions[session_id]) > Config.MAX_HISTORY_LENGTH * 2:
+                self.sessions[session_id] = self.sessions[session_id][-Config.MAX_HISTORY_LENGTH * 2:]
+    
+    def get_history(self, session_id: str) -> List[Dict]:
+        return self.sessions.get(session_id, [])
+
+dialog_history = DialogHistory()
 
 # Загрузка сертификата
 def download_certificate():
@@ -169,15 +195,24 @@ def is_answer_in_context(context: list) -> bool:
     content = "\n".join(doc.page_content for doc in context)
     return "не указано" not in content and len(content.strip()) > 50
 
-def prepare_prompt_input(question: str, context: list, web_search: str = "") -> dict:
+def prepare_prompt_input(question: str, context: list, web_search: str = "", history: List[Dict] = None) -> dict:
     address_section = format_address(context)
     context_str = "\n\n".join([doc.page_content for doc in context]) if context else "Нет данных в базе"
+    
+    # Формируем историю диалога для контекста
+    history_context = ""
+    if history:
+        history_context = "\n\nПредыдущие вопросы и ответы:\n"
+        for msg in history[-Config.MAX_HISTORY_LENGTH:]:  # Берем только последние N сообщений
+            prefix = "Вопрос: " if msg["role"] == "user" else "Ответ: "
+            history_context += f"{prefix}{msg['content']}\n"
     
     return {
         "context": context_str,
         "web_search": web_search,
         "question": question,
-        "address_section": address_section if address_section else "адрес не указан"
+        "address_section": address_section if address_section else "адрес не указан",
+        "history": history_context
     }
 
 def add_feedback_request(response: str) -> str:
@@ -192,6 +227,8 @@ TOURISM_PROMPT_TEMPLATE = """
 
 [Информация из интернета]:
 {web_search}
+
+{history}
 
 [Ваш вопрос]:
 {question}
@@ -227,7 +264,7 @@ TOURISM_PROMPT_TEMPLATE = """
 
 tourism_prompt = PromptTemplate.from_template(TOURISM_PROMPT_TEMPLATE)
 
-def handle_food_question(question: str) -> str:
+def handle_food_question(question: str, session_id: str) -> str:
     context = document_retriever.invoke(question)
     
     recommendations = []
@@ -257,39 +294,45 @@ def handle_food_question(question: str) -> str:
                 "- Какой уровень цен вас интересует?"
             )
     
+    dialog_history.add_message(session_id, "assistant", response)
     return add_feedback_request(response)
 
-def handle_general_question(question: str) -> str:
+def handle_general_question(question: str, session_id: str) -> str:
     context = document_retriever.invoke(question)
+    history = dialog_history.get_history(session_id)
     
     if is_answer_in_context(context):
-        prompt_input = prepare_prompt_input(question, context)
+        prompt_input = prepare_prompt_input(question, context, history=history)
         response = ai_assistant.invoke(tourism_prompt.format(**prompt_input))
     else:
         web_results = perform_web_search(question)
         if "Не найдено" not in web_results:
-            prompt_input = prepare_prompt_input(question, [], web_results)
+            prompt_input = prepare_prompt_input(question, [], web_results, history=history)
             response = ai_assistant.invoke(tourism_prompt.format(**prompt_input))
         else:
             response = "К сожалению, не удалось найти информацию. Попробуйте переформулировать вопрос."
     
+    dialog_history.add_message(session_id, "assistant", response)
     return add_feedback_request(response)
 
-def ask_question(question: str) -> str:
+def ask_question(question: str, session_id: str) -> str:
     if not question.strip():
         return "Пожалуйста, задайте ваш вопрос о Суздале. Я постараюсь помочь!"
 
+    dialog_history.add_message(session_id, "user", question)
+    
     food_keywords = ["еда", "поесть", "кафе", "ресторан", "перекусить", "кухня"]
     is_food_question = any(keyword in question.lower() for keyword in food_keywords)
     
     refinement = refine_question(question)
     if refinement:
+        dialog_history.add_message(session_id, "assistant", refinement)
         return refinement
     
     if is_food_question:
-        return handle_food_question(question)
+        return handle_food_question(question, session_id)
     
-    return handle_general_question(question)
+    return handle_general_question(question, session_id)
 
 # Инициализация компонентов
 download_certificate()
@@ -312,15 +355,19 @@ app.add_middleware(
 
 class Question(BaseModel):
     question: str
+    session_id: str = None  # Идентификатор сессии для поддержания контекста
 
 @app.post("/ask")
 async def ask(item: Question):
     try:
-        response = ask_question(item.question)
-        return {"answer": response}
+        # Создаем новую сессию, если не передана
+        if not item.session_id:
+            item.session_id = dialog_history.create_session()
+        
+        response = ask_question(item.question, item.session_id)
+        return {"answer": response, "session_id": item.session_id}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
-    import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8001)
