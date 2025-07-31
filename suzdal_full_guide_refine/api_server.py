@@ -24,7 +24,7 @@ load_dotenv()
 # Конфигурация
 class Config:
     MAX_RETRIES = 3
-    MIN_QUESTION_LENGTH = 4
+    MIN_QUESTION_LENGTH = 3
     SEARCH_RESULTS = 3
     RETRIEVER_K = 5
     CERT_PATH = os.getenv("CERT_PATH")
