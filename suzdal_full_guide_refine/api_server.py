@@ -15,7 +15,7 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnableParallel
 from tenacity import retry, stop_after_attempt, wait_exponential
 from ddgs import DDGS
-from typing import Dict, List
+from typing import Dict, List, Optional
 from uuid import uuid4
 
 # Загрузка переменных окружения
@@ -33,27 +33,50 @@ class Config:
     CSV_DATA_URL = "https://raw.githubusercontent.com/vuyq/SuzdalAI/refs/heads/main/suzdal_full_guide_refine/attractions.csv"
     MAX_HISTORY_LENGTH = 40  # Максимальное количество запоминаемых сообщений
 
-# Система хранения истории диалогов
-class DialogHistory:
+# Система хранения истории диалогов и состояний
+class DialogManager:
     def __init__(self):
-        self.sessions: Dict[str, List[Dict]] = {}
+        self.sessions: Dict[str, Dict] = {}
     
     def create_session(self) -> str:
         session_id = str(uuid4())
-        self.sessions[session_id] = []
+        self.sessions[session_id] = {
+            "history": [],
+            "awaiting_clarification": False,
+            "clarification_type": None,
+            "previous_question": None
+        }
         return session_id
     
     def add_message(self, session_id: str, role: str, content: str):
         if session_id in self.sessions:
-            self.sessions[session_id].append({"role": role, "content": content})
+            self.sessions[session_id]["history"].append({"role": role, "content": content})
             # Ограничиваем длину истории
-            if len(self.sessions[session_id]) > Config.MAX_HISTORY_LENGTH * 2:
-                self.sessions[session_id] = self.sessions[session_id][-Config.MAX_HISTORY_LENGTH * 2:]
+            if len(self.sessions[session_id]["history"]) > Config.MAX_HISTORY_LENGTH * 2:
+                self.sessions[session_id]["history"] = self.sessions[session_id]["history"][-Config.MAX_HISTORY_LENGTH * 2:]
     
     def get_history(self, session_id: str) -> List[Dict]:
-        return self.sessions.get(session_id, [])
+        return self.sessions.get(session_id, {}).get("history", [])
+    
+    def set_clarification_state(self, session_id: str, state: bool, clarification_type: Optional[str] = None):
+        if session_id in self.sessions:
+            self.sessions[session_id]["awaiting_clarification"] = state
+            self.sessions[session_id]["clarification_type"] = clarification_type if state else None
+    
+    def is_awaiting_clarification(self, session_id: str) -> bool:
+        return self.sessions.get(session_id, {}).get("awaiting_clarification", False)
+    
+    def get_clarification_type(self, session_id: str) -> Optional[str]:
+        return self.sessions.get(session_id, {}).get("clarification_type")
+    
+    def set_previous_question(self, session_id: str, question: str):
+        if session_id in self.sessions:
+            self.sessions[session_id]["previous_question"] = question
+    
+    def get_previous_question(self, session_id: str) -> Optional[str]:
+        return self.sessions.get(session_id, {}).get("previous_question")
 
-dialog_history = DialogHistory()
+dialog_manager = DialogManager()
 
 # Загрузка сертификата
 def download_certificate():
@@ -152,36 +175,35 @@ def perform_web_search(question: str) -> str:
         print(f"Ошибка поиска: {e}")
         return "Не удалось выполнить поиск"
 
-def refine_question(question: str, session_id: str) -> str:
+def refine_question(question: str, session_id: str) -> Optional[str]:
     question_lower = question.lower()
     words = question.strip().split()
     
-    # Получаем историю диалога
-    history = dialog_history.get_history(session_id)
-    
-    # Проверяем, был ли предыдущий ответ уточняющим вопросом
-    if history and history[-1]["role"] == "assistant" and "уточните" in history[-1]["content"].lower():
-        # Если это ответ на уточняющий вопрос - пропускаем уточнение
+    # Проверяем, не является ли это ответом на уточняющий вопрос
+    if dialog_manager.is_awaiting_clarification(session_id):
         return None
     
     food_keywords = ["еда", "поесть", "кафе", "ресторан", "перекусить", "кухня"]
     if any(keyword in question_lower for keyword in food_keywords) and len(words) < 6:
+        dialog_manager.set_clarification_state(session_id, True, "food_preferences")
         return (
             "Я могу порекомендовать места по разным критериям:\n"
-            "- По типу кухни (русская, итальянская, азиатская...)\n"
-            "- По расположению (центр, рядом с кремлем...)\n"
-            "- По бюджету (эконом, средний, премиум)\n"
-            "- По атмосфере (уютное, семейное, романтическое...)\n\n"
-            "Что для вас важнее при выборе места?"
+            "1. По типу кухни (русская, итальянская, азиатская...)\n"
+            "2. По расположению (центр, рядом с кремлем...)\n"
+            "3. По бюджету (эконом, средний, премиум)\n"
+            "4. По атмосфере (уютное, семейное, романтическое...)\n\n"
+            "Что для вас важнее при выборе места? Вы можете указать несколько критериев."
         )
     
     if len(words) < Config.MIN_QUESTION_LENGTH:
+        dialog_manager.set_clarification_state(session_id, True, "general_question")
         return (
             "Уточните, пожалуйста, ваш запрос. Например:\n"
-            "- Какие музеи стоит посетить с детьми?\n"
-            "- Где можно попробовать традиционную суздальскую кухню?\n"
-            "- Какие достопримечательности находятся в центре города?\n"
-            "- Где недорого пообедать рядом с Торговыми рядами?"
+            "1. Какие музеи стоит посетить с детьми?\n"
+            "2. Где можно попробовать традиционную суздальскую кухню?\n"
+            "3. Какие достопримечательности находятся в центре города?\n"
+            "4. Где недорого пообедать рядом с Торговыми рядами?\n\n"
+            "Какой вариант вам ближе или у вас другой вопрос?"
         )
     
     return None
@@ -272,10 +294,14 @@ TOURISM_PROMPT_TEMPLATE = """
 
 tourism_prompt = PromptTemplate.from_template(TOURISM_PROMPT_TEMPLATE)
 
-def handle_food_question(question: str, session_id: str) -> str:
+def handle_food_question(question: str, session_id: str, clarification: Optional[str] = None) -> str:
     if not hasattr(document_retriever, 'invoke'):
         return "Сервис временно недоступен. Пожалуйста, попробуйте позже."
-        
+    
+    # Если есть уточнение, модифицируем запрос
+    if clarification:
+        question = f"{dialog_manager.get_previous_question(session_id)} {clarification}"
+    
     context = document_retriever.invoke(question)
     
     recommendations = []
@@ -287,11 +313,18 @@ def handle_food_question(question: str, session_id: str) -> str:
             recommendations.append(f"- {name}: {desc}\n  Адрес: {address}")
     
     if recommendations:
-        response = (
-            "Вот несколько вариантов где можно поесть в Суздале:\n\n"
-            + "\n\n".join(recommendations[:5]) +
-            "\n\nМогу уточнить рекомендации по конкретным критериям - просто скажите, что для вас важно!"
-        )
+        if clarification:
+            response = (
+                "С учетом ваших предпочтений, вот подходящие варианты:\n\n"
+                + "\n\n".join(recommendations[:5]) +
+                "\n\nЕсли хотите уточнить критерии или узнать больше о каком-то месте - просто скажите!"
+            )
+        else:
+            response = (
+                "Вот несколько вариантов где можно поесть в Суздале:\n\n"
+                + "\n\n".join(recommendations[:5]) +
+                "\n\nМогу уточнить рекомендации по конкретным критериям - просто скажите, что для вас важно!"
+            )
     else:
         web_results = perform_web_search(question)
         if "Не найдено" not in web_results:
@@ -305,15 +338,20 @@ def handle_food_question(question: str, session_id: str) -> str:
                 "- Какой уровень цен вас интересует?"
             )
     
-    dialog_history.add_message(session_id, "assistant", response)
+    dialog_manager.add_message(session_id, "assistant", response)
+    dialog_manager.set_clarification_state(session_id, False)
     return add_feedback_request(response)
 
-def handle_general_question(question: str, session_id: str) -> str:
+def handle_general_question(question: str, session_id: str, clarification: Optional[str] = None) -> str:
     if not hasattr(document_retriever, 'invoke'):
         return "Сервис временно недоступен. Пожалуйста, попробуйте позже."
-        
+    
+    # Если есть уточнение, модифицируем запрос
+    if clarification:
+        question = f"{dialog_manager.get_previous_question(session_id)} {clarification}"
+    
     context = document_retriever.invoke(question)
-    history = dialog_history.get_history(session_id)
+    history = dialog_manager.get_history(session_id)
     
     if is_answer_in_context(context):
         prompt_input = prepare_prompt_input(question, context, history=history)
@@ -328,7 +366,8 @@ def handle_general_question(question: str, session_id: str) -> str:
         else:
             response = "К сожалению, не удалось найти информацию. Попробуйте переформулировать вопрос."
     
-    dialog_history.add_message(session_id, "assistant", response)
+    dialog_manager.add_message(session_id, "assistant", response)
+    dialog_manager.set_clarification_state(session_id, False)
     return add_feedback_request(response)
 
 def ask_question(question: str, session_id: str) -> str:
@@ -336,25 +375,23 @@ def ask_question(question: str, session_id: str) -> str:
         return "Пожалуйста, задайте ваш вопрос о Суздале. Я постараюсь помочь!"
 
     # Добавляем вопрос пользователя в историю
-    dialog_history.add_message(session_id, "user", question)
+    dialog_manager.add_message(session_id, "user", question)
     
-    # Проверяем, является ли это ответом на уточняющий вопрос
-    history = dialog_history.get_history(session_id)
-    if history and len(history) >= 2:
-        last_assistant_msg = history[-2]["content"] if history[-2]["role"] == "assistant" else ""
-        if "уточните" in last_assistant_msg.lower():
-            # Если это ответ на уточняющий вопрос - обрабатываем как обычный запрос
-            food_keywords = ["еда", "поесть", "кафе", "ресторан", "перекусить", "кухня"]
-            is_food_question = any(keyword in question.lower() for keyword in food_keywords)
-            
-            if is_food_question:
-                return handle_food_question(question, session_id)
-            return handle_general_question(question, session_id)
+    # Проверяем, ожидаем ли мы уточнения
+    if dialog_manager.is_awaiting_clarification(session_id):
+        clarification_type = dialog_manager.get_clarification_type(session_id)
+        dialog_manager.set_previous_question(session_id, question)
+        
+        if clarification_type == "food_preferences":
+            return handle_food_question(question, session_id, clarification=question)
+        elif clarification_type == "general_question":
+            return handle_general_question(question, session_id, clarification=question)
     
     # Стандартная обработка
     refinement = refine_question(question, session_id)
     if refinement:
-        dialog_history.add_message(session_id, "assistant", refinement)
+        dialog_manager.add_message(session_id, "assistant", refinement)
+        dialog_manager.set_previous_question(session_id, question)
         return refinement
     
     food_keywords = ["еда", "поесть", "кафе", "ресторан", "перекусить", "кухня"]
@@ -397,7 +434,7 @@ async def ask(item: Question):
 
         # Создаем новую сессию, если не передана
         if not item.session_id:
-            item.session_id = dialog_history.create_session()
+            item.session_id = dialog_manager.create_session()
         
         # Проверяем наличие вопроса
         if not item.question or not item.question.strip():
