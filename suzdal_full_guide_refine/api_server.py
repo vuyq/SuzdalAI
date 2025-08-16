@@ -1,6 +1,7 @@
 import os
 import requests
 import pandas as pd
+import uvicorn
 from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -13,10 +14,14 @@ from langchain_core.prompts import PromptTemplate
 from tenacity import retry, stop_after_attempt, wait_exponential
 from ddgs import DDGS
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
+from datetime import datetime
 
 # Настройка логирования
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 # Загрузка переменных окружения
@@ -36,14 +41,44 @@ class Config:
     CERT_URL = os.getenv("CERT_URL")
     GIGACHAT_AUTH = os.getenv("GIGACHAT_AUTH")
     CSV_DATA_URL = os.getenv("CSV_DATA_URL", "https://raw.githubusercontent.com/vuyq/SuzdalAI/main/suzdal_full_guide_refine/attractions.csv")
+    FEEDBACK_DIR = "feedback_logs"
     
     # Ключевые слова
     FOOD_KEYWORDS = ["еда", "поесть", "кафе", "ресторан", "перекусить", "кухня", "столовая", "меню"]
     MUSEUM_KEYWORDS = ["музей", "музеи", "экспозиция", "выставка", "галерея"]
     ATTRACTION_KEYWORDS = ["достопримечательность", "что посмотреть", "что посетить", "интересное место"]
+    
+    # Фразы для фидбека
+    FEEDBACK_PROMPT = "Был ли ответ полезен? (да/нет)"
+    POSITIVE_RESPONSES = ["да", "yes", "конечно", "полезен", "ага", "угу"]
+    NEGATIVE_RESPONSES = ["нет", "no", "не", "не полезен", "ноуп"]
+    FOLLOW_UP_PROMPT = "Напишите, что именно не понравилось?"
+    THANK_YOU_MSG = "Спасибо за ваш отзыв! Мы учтем это для улучшения сервиса."
+    POSITIVE_CONFIRMATION = "Очень рад, что был вам полезен! Чем еще могу помочь?"
 
 # Глобальное хранилище контекста
-DIALOG_CONTEXTS: Dict[str, List[Dict[str, str]]] = {}
+DIALOG_CONTEXTS: Dict[str, List[Dict[str, str]] = {}
+
+def ensure_feedback_dir():
+    """Создает директорию для хранения фидбеков при необходимости"""
+    os.makedirs(Config.FEEDBACK_DIR, exist_ok=True)
+
+def save_feedback(user_id: str, question: str, feedback_type: str, comment: str = ""):
+    """Сохранение фидбека в файл с датой"""
+    try:
+        ensure_feedback_dir()
+        today = datetime.now().strftime("%Y-%m-%d")
+        feedback_file = os.path.join(Config.FEEDBACK_DIR, f"feedback_{today}.csv")
+        
+        header = not os.path.exists(feedback_file)
+        
+        with open(feedback_file, "a", encoding="utf-8") as f:
+            if header:
+                f.write("timestamp;user_id;question;feedback_type;comment\n")
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            f.write(f"{timestamp};{user_id};{question};{feedback_type};{comment}\n")
+    except Exception as e:
+        logger.error(f"Ошибка сохранения фидбека: {e}")
 
 def download_certificate():
     """Загрузка SSL-сертификата при необходимости"""
@@ -85,7 +120,7 @@ def get_gigachat_token() -> str:
         logger.error(f"Ошибка получения токена: {e}")
         raise
 
-def initialize_models() -> tuple:
+def initialize_models() -> Tuple[GigaChatEmbeddings, GigaChat]:
     """Инициализация моделей GigaChat"""
     try:
         access_token = get_gigachat_token()
@@ -192,6 +227,19 @@ def get_dialog_context(user_id: str) -> str:
         for item in DIALOG_CONTEXTS[user_id]
     )
 
+def is_feedback_response(message: str) -> bool:
+    """Проверяет, является ли сообщение ответом на запрос фидбека"""
+    msg_lower = message.lower()
+    return any(word in msg_lower for word in Config.POSITIVE_RESPONSES + Config.NEGATIVE_RESPONSES)
+
+def is_feedback_request(message: str) -> bool:
+    """Проверяет, является ли сообщение запросом фидбека"""
+    return Config.FEEDBACK_PROMPT in message
+
+def is_follow_up_request(message: str) -> bool:
+    """Проверяет, является ли сообщение запросом уточнения фидбека"""
+    return Config.FOLLOW_UP_PROMPT in message
+
 def classify_question(question: str) -> str:
     """Классификация вопроса по категориям"""
     question_lower = question.lower()
@@ -212,12 +260,6 @@ def refine_question(question: str, user_id: str) -> Optional[str]:
     
     question_type = classify_question(question)
     
-    # Проверка предыдущего контекста
-    context = get_dialog_context(user_id)
-    if "assistant: Уточните" in context:
-        update_dialog_context(user_id, "clarification", question)
-        return None
-    
     if question_type == "food" and len(question.split()) < 5:
         return (
             "Я могу порекомендовать места по критериям:\n"
@@ -229,39 +271,53 @@ def refine_question(question: str, user_id: str) -> Optional[str]:
     
     return None
 
-def format_response(docs: List[Document], question_type: str) -> str:
-    """Форматирование ответа на основе документов"""
+def format_food_response(docs: List[Document]) -> str:
+    """Форматирование ответа о местах питания"""
     if not docs:
-        return "Информация не найдена."
+        return "К сожалению, не нашел подходящих мест по вашему запросу."
     
-    response = []
+    response = ["🍽️ Вот варианты где можно поесть:"]
+    for doc in docs[:5]:
+        name = doc.metadata.get("name", "Заведение")
+        cuisine = doc.metadata.get("type", "кухня не указана")
+        address = doc.metadata.get("address", "адрес не указан")
+        response.append(f"\n• {name} ({cuisine})\n  📍 {address}")
     
-    if question_type == "food":
-        response.append("🍽 Вот варианты где можно поесть:")
-        for doc in docs[:5]:
-            name = doc.metadata.get("name", "Заведение")
-            cuisine = doc.metadata.get("type", "кухня не указана")
-            address = doc.metadata.get("address", "адрес не указан")
-            response.append(f"\n• {name} ({cuisine})\n  📍 {address}")
-    
-    elif question_type == "museum":
-        response.append("🏛️ Музеи и выставки:")
-        for doc in docs[:5]:
-            name = doc.metadata.get("name", "Экспозиция")
-            desc = doc.page_content.split("\n")[0][:100] + "..."
-            address = doc.metadata.get("address", "адрес не указан")
-            response.append(f"\n• {name}\n  {desc}\n  📍 {address}")
-    
-    else:
-        response.append("🏰 Достопримечательности:")
-        for doc in docs[:5]:
-            name = doc.metadata.get("name", "Место")
-            desc = doc.page_content.split("\n")[0][:100] + "..."
-            address = doc.metadata.get("address", "адрес не указан")
-            response.append(f"\n• {name}\n  {desc}\n  📍 {address}")
-    
-    response.append("\nМогу уточнить детали по любому из мест.")
     return "\n".join(response)
+
+def generate_clarified_response(user_id: str, clarification: str) -> str:
+    """Генерация ответа на уточняющую информацию"""
+    try:
+        # Получаем весь контекст диалога
+        context = get_dialog_context(user_id)
+        
+        # Ищем первоначальный запрос (перед уточнением)
+        original_question = ""
+        for msg in reversed(DIALOG_CONTEXTS.get(user_id, [])):
+            if msg["role"] == "user" and not is_feedback_request(msg.get("message", "")):
+                original_question = msg["message"]
+                break
+        
+        if not original_question:
+            return format_food_response(document_retriever.invoke(clarification))
+        
+        # Комбинируем оригинальный вопрос и уточнение
+        combined_query = f"{original_question} {clarification}"
+        docs = document_retriever.invoke(combined_query)
+        
+        if docs:
+            return format_food_response(docs)
+        
+        # Если в базе нет результатов - ищем в интернете
+        web_results = perform_web_search(combined_query)
+        if "Не найдено" not in web_results:
+            return f"Вот что я нашел в интернете:\n{web_results}"
+        
+        return "К сожалению, не нашел вариантов по вашим критериям. Попробуйте изменить параметры поиска."
+    
+    except Exception as e:
+        logger.error(f"Ошибка генерации уточненного ответа: {e}")
+        return "Не удалось обработать ваш запрос. Пожалуйста, попробуйте еще раз."
 
 TOURISM_PROMPT_TEMPLATE = """
 Ты виртуальный гид по Суздалю. Отвечай на вопросы информативно и дружелюбно.
@@ -299,8 +355,8 @@ TOURISM_PROMPT_TEMPLATE = """
 
 tourism_prompt = PromptTemplate.from_template(TOURISM_PROMPT_TEMPLATE)
 
-def generate_response(question: str, context_docs: List[Document], 
-                    web_results: str, dialog_context: str) -> str:
+def generate_ai_response(question: str, context_docs: List[Document], 
+                        web_results: str, dialog_context: str) -> str:
     """Генерация ответа с помощью GigaChat"""
     try:
         prompt_input = {
@@ -315,40 +371,91 @@ def generate_response(question: str, context_docs: List[Document],
     
     except Exception as e:
         logger.error(f"Ошибка генерации ответа: {e}")
-        question_type = classify_question(question)
-        return format_response(context_docs, question_type)
+        return format_food_response(context_docs) if classify_question(question) == "food" else "Не удалось обработать запрос"
+
+def handle_feedback_flow(user_id: str, user_message: str) -> Optional[str]:
+    """Обработка потока фидбека"""
+    last_message = DIALOG_CONTEXTS.get(user_id, [{}])[-1].get("message", "")
+    
+    # Если это ответ на запрос фидбека
+    if is_feedback_request(last_message):
+        user_message_lower = user_message.lower()
+        
+        # Получаем оригинальный вопрос, на который дается фидбек
+        original_question = ""
+        for msg in reversed(DIALOG_CONTEXTS.get(user_id, [])):
+            if msg["role"] == "assistant" and Config.FEEDBACK_PROMPT in msg.get("message", ""):
+                # Ищем предшествующий пользовательский вопрос
+                for prev_msg in reversed(DIALOG_CONTEXTS.get(user_id, [])):
+                    if prev_msg["role"] == "user" and not is_feedback_response(prev_msg.get("message", "")):
+                        original_question = prev_msg["message"]
+                        break
+                break
+        
+        if any(pos in user_message_lower for pos in Config.POSITIVE_RESPONSES):
+            save_feedback(user_id, original_question, "positive")
+            return Config.POSITIVE_CONFIRMATION
+        
+        elif any(neg in user_message_lower for neg in Config.NEGATIVE_RESPONSES):
+            save_feedback(user_id, original_question, "negative")
+            return Config.FOLLOW_UP_PROMPT
+        
+        else:
+            return "Не понял ваш ответ. " + Config.FEEDBACK_PROMPT
+    
+    # Если это комментарий к отрицательному фидбеку
+    elif is_follow_up_request(last_message):
+        # Получаем оригинальный вопрос
+        original_question = ""
+        for msg in reversed(DIALOG_CONTEXTS.get(user_id, [])):
+            if msg["role"] == "user" and not is_feedback_response(msg.get("message", "")):
+                original_question = msg["message"]
+                break
+        
+        save_feedback(user_id, original_question, "negative_with_comment", user_message)
+        return Config.THANK_YOU_MSG
+    
+    return None
 
 def handle_question(question: str, user_id: str) -> str:
     """Основная обработка вопроса"""
     try:
-        # Проверка и уточнение вопроса
+        question = question.strip()
+        if not question:
+            return "Пожалуйста, задайте ваш вопрос о Суздале."
+        
+        # Обработка фидбек-потока
+        feedback_response = handle_feedback_flow(user_id, question)
+        if feedback_response:
+            update_dialog_context(user_id, "assistant", feedback_response)
+            return feedback_response
+        
+        # Проверка необходимости уточнения
         refinement = refine_question(question, user_id)
         if refinement:
             update_dialog_context(user_id, "assistant", refinement)
             return refinement
         
-        # Поиск в базе знаний
+        # Классификация вопроса
         question_type = classify_question(question)
+        
+        # Поиск в базе знаний
         context_docs = document_retriever.invoke(question)
         
-        # Если есть результаты в базе
+        # Формирование ответа
         if context_docs:
-            # Веб-поиск только если мало результатов
-            web_results = ""
-            if len(context_docs) < 2:
-                web_results = perform_web_search(question)
-            
+            web_results = perform_web_search(question) if len(context_docs) < 2 else ""
             dialog_context = get_dialog_context(user_id)
-            response = generate_response(question, context_docs, web_results, dialog_context)
+            response = generate_ai_response(question, context_docs, web_results, dialog_context)
         else:
-            # Если в базе нет результатов - только веб-поиск
             web_results = perform_web_search(question)
             dialog_context = get_dialog_context(user_id)
-            response = generate_response(question, [], web_results, dialog_context)
+            response = generate_ai_response(question, [], web_results, dialog_context)
         
-        # Сохраняем контекст
-        update_dialog_context(user_id, "assistant", response)
-        return response + "\n\nБыл ли ответ полезен? Задайте уточняющие вопросы!"
+        # Добавляем запрос фидбека к основному ответу
+        full_response = f"{response}\n\n{Config.FEEDBACK_PROMPT}"
+        update_dialog_context(user_id, "assistant", full_response)
+        return full_response
     
     except Exception as e:
         logger.error(f"Ошибка обработки вопроса: {e}")
@@ -356,6 +463,7 @@ def handle_question(question: str, user_id: str) -> str:
 
 # Инициализация приложения
 try:
+    ensure_feedback_dir()
     download_certificate()
     embedding_model, ai_assistant = initialize_models()
     documents = load_data()
@@ -402,5 +510,4 @@ async def ask(item: Question):
         )
 
 if __name__ == "__main__":
-    import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
