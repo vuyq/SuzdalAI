@@ -11,8 +11,10 @@ from langchain_core.documents import Document
 from langchain_gigachat import GigaChat, GigaChatEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.prompts import PromptTemplate
-from uuid import uuid4
-from typing import Dict, List, Optional
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnableParallel
+from tenacity import retry, stop_after_attempt, wait_exponential
+from ddgs import DDGS
 
 # Загрузка переменных окружения
 load_dotenv()
@@ -20,78 +22,38 @@ load_dotenv()
 # Конфигурация
 class Config:
     MAX_RETRIES = 3
-    MIN_QUESTION_LENGTH = 3
+    MIN_QUESTION_LENGTH = 4
     SEARCH_RESULTS = 3
     RETRIEVER_K = 5
     CERT_PATH = os.getenv("CERT_PATH")
     CERT_URL = os.getenv("CERT_URL")
     GIGACHAT_AUTH = os.getenv("GIGACHAT_AUTH")
     CSV_DATA_URL = "https://raw.githubusercontent.com/vuyq/SuzdalAI/refs/heads/main/suzdal_full_guide_refine/attractions.csv"
-    MAX_HISTORY_LENGTH = 40
+    MAX_CONTEXT_LENGTH = 3  # Максимальное количество сохраняемых сообщений в контексте
 
-class DialogManager:
-    def __init__(self):
-        self.sessions: Dict[str, Dict] = {}
-    
-    def create_session(self) -> str:
-        session_id = str(uuid4())
-        self.sessions[session_id] = {
-            "history": [],
-            "awaiting_clarification": False,
-            "clarification_type": None,
-            "previous_question": None
-        }
-        return session_id
-    
-    def add_message(self, session_id: str, role: str, content: str):
-        if session_id in self.sessions:
-            self.sessions[session_id]["history"].append({"role": role, "content": content})
-            # Ограничиваем длину истории
-            self.sessions[session_id]["history"] = self.sessions[session_id]["history"][-Config.MAX_HISTORY_LENGTH * 2:]
-    
-    def get_history(self, session_id: str) -> List[Dict]:
-        return self.sessions.get(session_id, {}).get("history", [])
-    
-    def set_clarification_state(self, session_id: str, state: bool, clarification_type: Optional[str] = None):
-        if session_id in self.sessions:
-            self.sessions[session_id]["awaiting_clarification"] = state
-            self.sessions[session_id]["clarification_type"] = clarification_type if state else None
-    
-    def is_awaiting_clarification(self, session_id: str) -> bool:
-        return self.sessions.get(session_id, {}).get("awaiting_clarification", False)
-    
-    def get_clarification_type(self, session_id: str) -> Optional[str]:
-        return self.sessions.get(session_id, {}).get("clarification_type")
-    
-    def set_previous_question(self, session_id: str, question: str):
-        if session_id in self.sessions:
-            self.sessions[session_id]["previous_question"] = question
-    
-    def get_previous_question(self, session_id: str) -> Optional[str]:
-        return self.sessions.get(session_id, {}).get("previous_question")
+# Глобальное хранилище контекста диалогов
+DIALOG_CONTEXTS = {}
 
-dialog_manager = DialogManager()
-
+# Загрузка сертификата
 def download_certificate():
-    if Config.CERT_PATH and Config.CERT_URL and not Path(Config.CERT_PATH).exists():
+    if not Path(Config.CERT_PATH).exists():
         try:
             response = requests.get(Config.CERT_URL)
             response.raise_for_status()
-            os.makedirs(os.path.dirname(Config.CERT_PATH), exist_ok=True)
             with open(Config.CERT_PATH, "wb") as f:
                 f.write(response.content)
+            print("Сертификат успешно скачан")
         except Exception as e:
             raise Exception(f"Не удалось скачать сертификат: {str(e)}")
 
+@retry(stop=stop_after_attempt(Config.MAX_RETRIES), 
+       wait=wait_exponential(multiplier=1, min=2, max=10))
 def get_gigachat_token():
-    if not Config.GIGACHAT_AUTH:
-        raise Exception("GIGACHAT_AUTH не установлен в переменных окружения")
-    
     url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
     headers = {
         'Content-Type': 'application/x-www-form-urlencoded',
         'Accept': 'application/json',
-        'RqUID': str(uuid4()),
+        'RqUID': 'a2231e67-570e-47ca-bae8-82ca565850eb',
         'Authorization': f'Basic {Config.GIGACHAT_AUTH}'
     }
     payload = {'scope': 'GIGACHAT_API_PERS'}
@@ -112,6 +74,7 @@ def get_gigachat_token():
 def initialize_models():
     try:
         access_token = get_gigachat_token()
+        print("Токен успешно получен")
         
         embedding_model = GigaChatEmbeddings(
             access_token=access_token,
@@ -131,18 +94,16 @@ def initialize_models():
         
         return embedding_model, ai_assistant
     except Exception as e:
-        raise Exception(f"Ошибка инициализации моделей: {str(e)}")
+        print(f"Ошибка инициализации моделей: {str(e)}")
+        raise
 
 def load_data():
     try:
         df = pd.read_csv(Config.CSV_DATA_URL, sep=';')
-    except Exception as e:
-        try:
-            df = pd.read_csv(Config.CSV_DATA_URL)
-        except Exception as e:
-            raise Exception("Не удалось загрузить данные")
+    except Exception:
+        df = pd.read_csv(Config.CSV_DATA_URL, on_bad_lines='skip')
     
-    return [
+    text_documents = [
         Document(
             page_content="\n".join(
                 f"{col}: {val if pd.notna(val) else 'не указано'}" 
@@ -152,51 +113,82 @@ def load_data():
                 "title": row.get("Name", ""),
                 "type": row.get("Type", ""),
                 "tags": row.get("Tags", ""),
-                "address": row.get("Address", "не указан")
+                "address": row.get("Address", "не указано")
             }
         )
         for _, row in df.iterrows()
     ]
+    return text_documents
 
 def perform_web_search(question: str) -> str:
     try:
+        results = []
         with DDGS() as ddgs:
-            results = [
-                f"{r['title']}\n{r['href']}\n{r['body']}"
-                for r in ddgs.text(f"{question} Суздаль site:ru", max_results=Config.SEARCH_RESULTS)
-            ]
+            for r in ddgs.text(f"{question} Суздаль site:ru", max_results=Config.SEARCH_RESULTS):
+                results.append(f"{r['title']}\n{r['href']}\n{r['body']}")
         return "\n\n".join(results) if results else "Не найдено информации в интернете"
-    except Exception:
+    except Exception as e:
+        print(f"Ошибка поиска: {e}")
         return "Не удалось выполнить поиск"
 
-def refine_question(question: str, session_id: str) -> Optional[str]:
-    question_lower = question.lower()
+def update_dialog_context(user_id: str, role: str, message: str):
+    """Обновляет контекст диалога для конкретного пользователя"""
+    if user_id not in DIALOG_CONTEXTS:
+        DIALOG_CONTEXTS[user_id] = []
     
-    if dialog_manager.is_awaiting_clarification(session_id):
+    # Добавляем новое сообщение
+    DIALOG_CONTEXTS[user_id].append({"role": role, "message": message})
+    
+    # Ограничиваем длину контекста
+    if len(DIALOG_CONTEXTS[user_id]) > Config.MAX_CONTEXT_LENGTH:
+        DIALOG_CONTEXTS[user_id] = DIALOG_CONTEXTS[user_id][-Config.MAX_CONTEXT_LENGTH:]
+
+def get_dialog_context(user_id: str) -> str:
+    """Возвращает форматированный контекст диалога"""
+    if user_id not in DIALOG_CONTEXTS or not DIALOG_CONTEXTS[user_id]:
+        return "Нет предыдущего контекста"
+    
+    return "\n".join(
+        f"{item['role']}: {item['message']}" 
+        for item in DIALOG_CONTEXTS[user_id]
+    )
+
+def refine_question(question: str, user_id: str) -> str:
+    """Определяет, нужно ли уточнение вопроса, и возвращает уточняющий вопрос если нужно"""
+    question_lower = question.lower()
+    words = question.strip().split()
+    
+    # Проверяем контекст предыдущих сообщений
+    context = get_dialog_context(user_id)
+    
+    # Если предыдущее сообщение было уточняющим вопросом, сохраняем ответ как уточнение
+    if "assistant: Уточните" in context or "assistant: Я могу порекомендовать" in context:
+        update_dialog_context(user_id, "clarification", question)
         return None
     
     food_keywords = ["еда", "поесть", "кафе", "ресторан", "перекусить", "кухня"]
-    if any(keyword in question_lower for keyword in food_keywords) and len(question.strip().split()) < 6:
-        dialog_manager.set_clarification_state(session_id, True, "food_preferences")
-        return (
+    if any(keyword in question_lower for keyword in food_keywords) and len(words) < 6:
+        refinement = (
             "Я могу порекомендовать места по разным критериям:\n"
-            "1. По типу кухни (русская, итальянская, азиатская...)\n"
-            "2. По расположению (центр, рядом с кремлем...)\n"
-            "3. По бюджету (эконом, средний, премиум)\n"
-            "4. По атмосфере (уютное, семейное, романтическое...)\n\n"
-            "Что для вас важнее при выборе места? Можете указать несколько критериев."
+            "- По типу кухни (русская, итальянская, азиатская...)\n"
+            "- По расположению (центр, рядом с кремлем...)\n"
+            "- По бюджету (эконом, средний, премиум)\n"
+            "- По атмосфере (уютное, семейное, романтическое...)\n\n"
+            "Что для вас важнее при выборе места?"
         )
+        update_dialog_context(user_id, "assistant", refinement)
+        return refinement
     
-    if len(question.strip().split()) < Config.MIN_QUESTION_LENGTH:
-        dialog_manager.set_clarification_state(session_id, True, "general_question")
-        return (
+    if len(words) < Config.MIN_QUESTION_LENGTH:
+        refinement = (
             "Уточните, пожалуйста, ваш запрос. Например:\n"
-            "1. Какие музеи стоит посетить с детьми?\n"
-            "2. Где можно попробовать традиционную суздальскую кухню?\n"
-            "3. Какие достопримечательности находятся в центре города?\n"
-            "4. Где недорого пообедать рядом с Торговыми рядами?\n\n"
-            "Какой вариант вам ближе или у вас другой вопрос?"
+            "- Какие музеи стоит посетить с детьми?\n"
+            "- Где можно попробовать традиционную суздальскую кухню?\n"
+            "- Какие достопримечательности находятся в центре города?\n"
+            "- Где недорого пообедать рядом с Торговыми рядами?"
         )
+        update_dialog_context(user_id, "assistant", refinement)
+        return refinement
     
     return None
 
@@ -204,8 +196,12 @@ def format_address(context_docs: list) -> str:
     if not context_docs:
         return ""
     
-    address = context_docs[0].metadata.get("address", "не указан")
-    return "" if address.lower() in ["не указан", "нет информации", ""] else address
+    main_doc = context_docs[0]
+    address = main_doc.metadata.get("address", "не указано")
+    
+    if address.lower() in ["не указано", "нет информации", ""]:
+        return ""
+    return address
 
 def is_answer_in_context(context: list) -> bool:
     if not context:
@@ -213,30 +209,27 @@ def is_answer_in_context(context: list) -> bool:
     content = "\n".join(doc.page_content for doc in context)
     return "не указано" not in content and len(content.strip()) > 50
 
-def prepare_prompt_input(question: str, context: list, web_search: str = "", history: List[Dict] = None) -> dict:
+def prepare_prompt_input(question: str, context: list, web_search: str = "", dialog_context: str = "") -> dict:
     address_section = format_address(context)
-    context_str = "\n\n".join(doc.page_content for doc in context) if context else "Нет данных в базе"
-    
-    history_context = ""
-    if history:
-        history_context = "\n\nПредыдущие вопросы и ответы:\n" + "\n".join(
-            f"{'Вопрос' if msg['role'] == 'user' else 'Ответ'}: {msg['content']}"
-            for msg in history[-Config.MAX_HISTORY_LENGTH:]
-        )
+    context_str = "\n\n".join([doc.page_content for doc in context]) if context else "Нет данных в базе"
     
     return {
         "context": context_str,
         "web_search": web_search,
         "question": question,
-        "address_section": address_section or "адрес не указан",
-        "history": history_context
+        "address_section": address_section if address_section else "адрес не указан",
+        "dialog_context": dialog_context
     }
 
 def add_feedback_request(response: str) -> str:
-    return response + "\n\nБыл ли этот ответ полезен для вас? Если у вас есть дополнительные вопросы, не стесняйтесь задавать!"
+    feedback_prompt = "\n\nБыл ли этот ответ полезен для вас? Если у вас есть дополнительные вопросы, не стесняйтесь задавать!"
+    return response + feedback_prompt
 
 TOURISM_PROMPT_TEMPLATE = """
-Привет! Я ваш виртуальный гид по Суздалю. Я постараюсь дать максимально полезный и точный ответ.
+Привет! Я ваш виртуальный гид по Суздалю. Отвечаю на вопросы о достопримечательностях, питании и услугах.
+
+[Предыдущий диалог]:
+{dialog_context}
 
 [Контекст из базы знаний]:
 {context}
@@ -244,52 +237,46 @@ TOURISM_PROMPT_TEMPLATE = """
 [Информация из интернета]:
 {web_search}
 
-{history}
-
 [Ваш вопрос]:
 {question}
 
-Правила формирования ответа:
-1. Если информация есть в базе:
-- Начните с "Вот что я нашел:"
-- Укажите название и тип места
-- Кратко опишите, почему стоит посетить
-- Добавьте адрес, если известен: {address_section}
-- Дайте полезный совет или лайфхак
-- В конце спросите, был ли ответ полезен
+Правила ответа:
+1. Для вопросов о питании:
+- Учитывайте предыдущие уточнения пользователя
+- Перечислите 3-5 подходящих мест
+- Укажите тип заведения, кухню, средний чек (если известен)
+- Дайте адрес или ориентир
+- Предложите уточнить по критериям
 
-2. Если информации нет в базе, но есть в интернете:
-- Начните с "Вот что я нашел в интернете:"
-- Предоставьте краткую выжимку
-- Укажите источник (если доступен)
-- Предложите уточнить вопрос, если информация недостаточно точная
-- В конце спросите, был ли ответ полезен
+2. Для других вопросов:
+- Дайте развернутый ответ на основе данных
+- Если данных нет, используйте интернет-источники
+- Учитывайте контекст предыдущих вопросов
+- Предложите уточнить при необходимости
 
-3. Если вопрос слишком общий:
-- Вежливо попросите уточнить
-- Приведите 2-3 примера, как можно уточнить вопрос
-- Предложите помощь в формулировке запроса
-
-4. Если информации нет вообще:
-- Извинитесь
-- Предложите альтернативные варианты (другие достопримечательности, общую информацию)
-- Предложите поискать другую информацию по Суздалю
-
-Ваш ответ (обязательно соблюдайте структуру и будьте дружелюбны):
+Будьте дружелюбны и информативны:
 """
 
 tourism_prompt = PromptTemplate.from_template(TOURISM_PROMPT_TEMPLATE)
 
-def handle_food_question(question: str, session_id: str, clarification: Optional[str] = None) -> str:
-    final_question = f"{question} {clarification}" if clarification else question
+def handle_food_question(question: str, user_id: str) -> str:
+    # Получаем контекст диалога
+    dialog_context = get_dialog_context(user_id)
     
-    if "кухня" not in final_question.lower():
-        final_question += " кухня"
+    # Проверяем наличие уточнений
+    clarification = None
+    for msg in DIALOG_CONTEXTS.get(user_id, []):
+        if msg["role"] == "clarification":
+            clarification = msg["message"]
+            break
     
-    try:
-        context = document_retriever.invoke(final_question)
-    except Exception:
-        return "Произошла ошибка при поиске информации о местах питания. Пожалуйста, попробуйте позже."
+    # Формируем уточненный вопрос при наличии
+    search_question = question
+    if clarification:
+        search_question = f"{question} (уточнение: {clarification})"
+    
+    # Ищем в базе знаний
+    context = document_retriever.invoke(search_question)
     
     recommendations = []
     for doc in context:
@@ -297,110 +284,103 @@ def handle_food_question(question: str, session_id: str, clarification: Optional
             name = doc.metadata.get("title", "Заведение")
             desc = doc.page_content.split("\n")[0][:100] + "..."
             address = doc.metadata.get("address", "адрес не указан")
-            tags = doc.metadata.get("tags", "").lower()
-            
-            if clarification:
-                if "итальянск" in clarification.lower() and "итальянск" not in tags:
-                    continue
-                if "центр" in clarification.lower() and "центр" not in address.lower():
-                    continue
-            
             recommendations.append(f"- {name}: {desc}\n  Адрес: {address}")
     
     if recommendations:
         response = (
-            f"С учетом ваших предпочтений ({clarification}), вот подходящие варианты:\n\n"
-            if clarification else
-            "Вот несколько мест где можно поесть в Суздале:\n\n"
-        ) + "\n\n".join(recommendations[:5]) + (
-            "\n\nЕсли хотите уточнить критерии или узнать больше - просто спросите!"
+            "Вот несколько вариантов где можно поесть в Суздале:\n\n"
+            + "\n\n".join(recommendations[:5]) +
+            "\n\nМогу уточнить рекомендации по конкретным критериям - просто скажите, что для вас важно!"
         )
     else:
-        web_results = perform_web_search(final_question)
-        response = (
-            f"В базе нет подходящих вариантов, но вот что я нашел в интернете:\n{web_results}"
-            if "Не найдено" not in web_results else
-            "К сожалению, не нашел подходящих вариантов по вашему запросу.\n"
-            "Можете уточнить:\n"
-            "- Точное название заведения\n"
-            "- Другие критерии поиска\n"
-            "- Интересующую вас кухню или тип заведения"
-        )
+        web_results = perform_web_search(search_question)
+        if "Не найдено" not in web_results:
+            response = f"Вот что я нашел в интернете:\n{web_results}"
+        else:
+            response = (
+                "К сожалению, не нашел конкретных рекомендаций. "
+                "Попробуйте уточнить:\n"
+                "- Какую кухню предпочитаете?\n"
+                "- В каком районе ищете заведение?\n"
+                "- Какой уровень цен вас интересует?"
+            )
     
-    dialog_manager.add_message(session_id, "assistant", response)
-    dialog_manager.set_clarification_state(session_id, False)
+    # Обновляем контекст диалога
+    update_dialog_context(user_id, "user", question)
+    update_dialog_context(user_id, "assistant", response)
+    
     return add_feedback_request(response)
 
-def handle_general_question(question: str, session_id: str, clarification: Optional[str] = None) -> str:
-    final_question = f"{question} {clarification}" if clarification else question
+def handle_general_question(question: str, user_id: str) -> str:
+    # Получаем контекст диалога
+    dialog_context = get_dialog_context(user_id)
     
-    try:
-        context = document_retriever.invoke(final_question)
-    except Exception:
-        return "Произошла ошибка при обработке вашего запроса. Пожалуйста, попробуйте позже."
+    # Проверяем наличие уточнений
+    clarification = None
+    for msg in DIALOG_CONTEXTS.get(user_id, []):
+        if msg["role"] == "clarification":
+            clarification = msg["message"]
+            break
     
-    history = dialog_manager.get_history(session_id)
+    # Формируем уточненный вопрос при наличии
+    search_question = question
+    if clarification:
+        search_question = f"{question} (уточнение: {clarification})"
+    
+    # Ищем в базе знаний
+    context = document_retriever.invoke(search_question)
     
     if is_answer_in_context(context):
-        prompt_input = prepare_prompt_input(final_question, context, history=history)
-        try:
-            response = ai_assistant.invoke(tourism_prompt.format(**prompt_input))
-        except Exception:
-            response = "Произошла ошибка при генерации ответа. Пожалуйста, попробуйте позже."
+        prompt_input = prepare_prompt_input(
+            question=search_question,
+            context=context,
+            dialog_context=dialog_context
+        )
+        response = ai_assistant.invoke(tourism_prompt.format(**prompt_input))
     else:
-        web_results = perform_web_search(final_question)
+        web_results = perform_web_search(search_question)
         if "Не найдено" not in web_results:
-            prompt_input = prepare_prompt_input(final_question, [], web_results, history=history)
-            try:
-                response = ai_assistant.invoke(tourism_prompt.format(**prompt_input))
-            except Exception:
-                response = "Произошла ошибка при генерации ответа. Пожалуйста, попробуйте позже."
+            prompt_input = prepare_prompt_input(
+                question=search_question,
+                context=[],
+                web_search=web_results,
+                dialog_context=dialog_context
+            )
+            response = ai_assistant.invoke(tourism_prompt.format(**prompt_input))
         else:
             response = "К сожалению, не удалось найти информацию. Попробуйте переформулировать вопрос."
     
-    dialog_manager.add_message(session_id, "assistant", response)
-    dialog_manager.set_clarification_state(session_id, False)
+    # Обновляем контекст диалога
+    update_dialog_context(user_id, "user", question)
+    update_dialog_context(user_id, "assistant", response)
+    
     return add_feedback_request(response)
 
-def ask_question(question: str, session_id: str) -> str:
+def ask_question(question: str, user_id: str = "default") -> str:
     if not question.strip():
         return "Пожалуйста, задайте ваш вопрос о Суздале. Я постараюсь помочь!"
 
-    dialog_manager.add_message(session_id, "user", question)
-    
-    if dialog_manager.is_awaiting_clarification(session_id):
-        prev_question = dialog_manager.get_previous_question(session_id)
-        clarification_type = dialog_manager.get_clarification_type(session_id)
-        
-        if clarification_type == "food_preferences":
-            dialog_manager.set_previous_question(session_id, prev_question)
-            return handle_food_question(prev_question, session_id, clarification=question)
-        elif clarification_type == "general_question":
-            dialog_manager.set_previous_question(session_id, prev_question)
-            return handle_general_question(prev_question, session_id, clarification=question)
-    
-    refinement = refine_question(question, session_id)
-    if refinement:
-        dialog_manager.add_message(session_id, "assistant", refinement)
-        dialog_manager.set_previous_question(session_id, question)
-        return refinement
+    # Добавляем вопрос пользователя в контекст
+    update_dialog_context(user_id, "user", question)
     
     food_keywords = ["еда", "поесть", "кафе", "ресторан", "перекусить", "кухня"]
-    if any(keyword in question.lower() for keyword in food_keywords):
-        return handle_food_question(question, session_id)
+    is_food_question = any(keyword in question.lower() for keyword in food_keywords)
     
-    return handle_general_question(question, session_id)
+    refinement = refine_question(question, user_id)
+    if refinement:
+        return refinement
+    
+    if is_food_question:
+        return handle_food_question(question, user_id)
+    
+    return handle_general_question(question, user_id)
 
 # Инициализация компонентов
-try:
-    download_certificate()
-    embedding_model, ai_assistant = initialize_models()
-    text_documents = load_data()
-    vector_store = FAISS.from_documents(text_documents, embedding_model)
-    document_retriever = vector_store.as_retriever(search_kwargs={"k": Config.RETRIEVER_K})
-except Exception as e:
-    print(f"Ошибка инициализации: {str(e)}")
-    raise
+download_certificate()
+embedding_model, ai_assistant = initialize_models()
+text_documents = load_data()
+vector_store = FAISS.from_documents(text_documents, embedding_model)
+document_retriever = vector_store.as_retriever(search_kwargs={"k": Config.RETRIEVER_K})
 
 # FastAPI приложение
 app = FastAPI(title="Суздаль Tourism Assistant", 
@@ -416,26 +396,15 @@ app.add_middleware(
 
 class Question(BaseModel):
     question: str
-    session_id: Optional[str] = None
+    user_id: str = "default"
 
 @app.post("/ask")
 async def ask(item: Question):
     try:
-        if not item.session_id:
-            item.session_id = dialog_manager.create_session()
-        
-        response = ask_question(item.question, item.session_id)
-        return {
-            "answer": response,
-            "session_id": item.session_id
-        }
-            
+        response = ask_question(item.question, item.user_id)
+        return {"answer": response}
     except Exception as e:
-        print(f"Unexpected error: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail="Internal server error"
-        )
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8001)
