@@ -57,7 +57,7 @@ class Config:
     POSITIVE_CONFIRMATION = "Очень рад, что был вам полезен! Чем еще могу помочь?"
 
 # Глобальное хранилище контекста
-DIALOG_CONTEXTS: Dict[str, List[Dict[str, str]] = {}
+DIALOG_CONTEXTS: Dict[str, List[Dict[str, str]]] = {}
 
 def ensure_feedback_dir():
     """Создает директорию для хранения фидбеков при необходимости"""
