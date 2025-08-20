@@ -52,45 +52,8 @@ class Config:
         "Какой вариант выбрать?"
     ]
 
-class FeedbackStorage:
-    def __init__(self):
-        self.feedback_data = []
-        self.feedback_file = "user_feedback.csv"
-        self.load_feedback()
-
-    def load_feedback(self):
-        try:
-            if os.path.exists(self.feedback_file):
-                df = pd.read_csv(self.feedback_file)
-                self.feedback_data = df.to_dict('records')
-                logger.info(f"Loaded {len(self.feedback_data)} feedback records")
-            else:
-                self.feedback_data = []
-        except Exception as e:
-            logger.error(f"Error loading feedback: {e}")
-            self.feedback_data = []
-
-    def save_feedback(self, user_id: str, question: str, helpful: bool, comment: str = ""):
-        try:
-            feedback = {
-                "user_id": user_id,
-                "question": question,
-                "helpful": helpful,
-                "comment": comment,
-                "timestamp": datetime.now().isoformat()
-            }
-            self.feedback_data.append(feedback)
-            
-            # Save to CSV
-            df = pd.DataFrame(self.feedback_data)
-            df.to_csv(self.feedback_file, index=False)
-            logger.info(f"Saved feedback for user {user_id}: helpful={helpful}")
-        except Exception as e:
-            logger.error(f"Error saving feedback: {e}")
-
 # Глобальное хранилище контекста
 DIALOG_CONTEXTS: Dict[str, List[Dict[str, str]]] = {}
-FEEDBACK_CONTEXT: Dict[str, Dict[str, str]] = {}  # user_id -> {question: last_question, awaiting_feedback: bool}
 
 def download_certificate():
     """Загрузка SSL-сертификата при необходимости"""
@@ -286,7 +249,7 @@ def format_food_response(docs: List[Document]) -> str:
         address = doc.metadata.get("address", "адрес не указан")
         response.append(f"\n• {name} ({cuisine})\n  📍 {address}")
     
-    return "\n".join(response) + "\n\nМогу уточнить детали по любому месту."
+    return "\n".join(response)
 
 def generate_clarified_response(user_id: str, clarification: str) -> str:
     """Генерация ответа на уточняющую информацию"""
@@ -376,75 +339,12 @@ def generate_ai_response(question: str, context_docs: List[Document],
         logger.error(f"Ошибка генерации ответа: {e}")
         return format_food_response(context_docs) if classify_question(question) == "food" else "Не удалось обработать запрос"
 
-def is_feedback_response(user_id: str, question: str) -> Tuple[bool, str]:
-    """Check if user is responding to feedback request"""
-    if user_id not in FEEDBACK_CONTEXT:
-        return False, ""
-    
-    # Check if we're awaiting feedback
-    if FEEDBACK_CONTEXT[user_id].get('awaiting_feedback', False):
-        return True, FEEDBACK_CONTEXT[user_id].get('last_question', '')
-    
-    # Check if previous message was asking for feedback
-    if user_id in DIALOG_CONTEXTS and len(DIALOG_CONTEXTS[user_id]) > 0:
-        last_message = DIALOG_CONTEXTS[user_id][-1]["message"]
-        if "Был ли ответ полезен" in last_message or "Был ли полезен этот ответ" in last_message:
-            # Find the original question
-            for msg in reversed(DIALOG_CONTEXTS[user_id]):
-                if msg["role"] == "user" and "Был ли" not in msg["message"]:
-                    FEEDBACK_CONTEXT[user_id] = {
-                        'last_question': msg["message"],
-                        'awaiting_feedback': True
-                    }
-                    return True, msg["message"]
-    
-    return False, ""
-
-def process_feedback(user_id: str, feedback: str, original_question: str) -> str:
-    """Обработка отзыва пользователя"""
-    feedback_lower = feedback.strip().lower()
-    
-    if feedback_lower in ['да', 'yes', 'конечно', 'ага', 'полезен']:
-        feedback_storage.save_feedback(user_id, original_question, True)
-        # Clear feedback context
-        if user_id in FEEDBACK_CONTEXT:
-            FEEDBACK_CONTEXT[user_id]['awaiting_feedback'] = False
-        return "Очень рад, что был вам полезен! Чем еще могу помочь?"
-    
-    elif feedback_lower in ['нет', 'no', 'не очень', 'неа', 'не полезен']:
-        # Ask for details
-        if user_id in FEEDBACK_CONTEXT:
-            FEEDBACK_CONTEXT[user_id]['awaiting_feedback'] = True
-        return "Простите, что нам не удалось вам помочь. Напишите, что именно не понравилось или что можно улучшить?"
-    
-    else:
-        # If user provides detailed feedback after saying "no"
-        if user_id in FEEDBACK_CONTEXT and FEEDBACK_CONTEXT[user_id].get('awaiting_feedback', False):
-            feedback_storage.save_feedback(user_id, original_question, False, feedback)
-            FEEDBACK_CONTEXT[user_id]['awaiting_feedback'] = False
-            return "Спасибо за ваш отзыв! Мы учтем это для улучшения сервиса. Чем еще могу помочь?"
-        
-        # If not clear feedback, treat as new question
-        return None
-
 def handle_question(question: str, user_id: str) -> str:
     """Основная обработка вопроса"""
     try:
         question = question.strip()
         if not question:
             return "Пожалуйста, задайте ваш вопрос о Суздале."
-        
-        # Initialize feedback context if needed
-        if user_id not in FEEDBACK_CONTEXT:
-            FEEDBACK_CONTEXT[user_id] = {'awaiting_feedback': False, 'last_question': ''}
-        
-        # Check if this is feedback response
-        is_feedback, original_question = is_feedback_response(user_id, question)
-        if is_feedback:
-            feedback_result = process_feedback(user_id, question, original_question)
-            if feedback_result:
-                update_dialog_context(user_id, "assistant", feedback_result)
-                return feedback_result
         
         # Получаем предыдущий контекст
         dialog_context = get_dialog_context(user_id)
@@ -480,12 +380,7 @@ def handle_question(question: str, user_id: str) -> str:
         update_dialog_context(user_id, "user", question)
         update_dialog_context(user_id, "assistant", response)
         
-        # Store question for potential feedback
-        FEEDBACK_CONTEXT[user_id]['last_question'] = question
-        
-        # Добавляем вопрос о фидбеке
-        feedback_question = "\n\nБыл ли этот ответ полезен? (да/нет)"
-        return response + feedback_question
+        return response
     
     except Exception as e:
         logger.error(f"Ошибка обработки вопроса: {e}")
@@ -504,9 +399,6 @@ try:
     document_retriever = vector_store.as_retriever(
         search_kwargs={"k": Config.RETRIEVER_K}
     )
-    
-    # Initialize feedback storage
-    feedback_storage = FeedbackStorage()
     
 except Exception as e:
     logger.critical(f"Ошибка инициализации: {e}")
@@ -544,4 +436,4 @@ async def ask(item: Question):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8001)
