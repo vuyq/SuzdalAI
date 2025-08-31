@@ -53,7 +53,8 @@ class Message(Base):
     role = Column(String(10), nullable=False)
     content = Column(Text, nullable=False)
     timestamp = Column(DateTime, default=datetime.utcnow)
-    metadata = Column(JSON, nullable=True)
+    # Переименовано с 'metadata' на 'message_metadata'
+    message_metadata = Column(JSON, nullable=True)
 
 # Создание таблиц
 Base.metadata.create_all(bind=engine)
