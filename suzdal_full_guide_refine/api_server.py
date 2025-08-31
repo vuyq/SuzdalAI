@@ -20,6 +20,7 @@ from ddgs import DDGS
 import logging
 from typing import Dict, List, Optional, Tuple
 import uuid
+import re
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -53,7 +54,6 @@ class Message(Base):
     role = Column(String(10), nullable=False)
     content = Column(Text, nullable=False)
     timestamp = Column(DateTime, default=datetime.utcnow)
-    # Переименовано с 'metadata' на 'message_metadata'
     message_metadata = Column(JSON, nullable=True)
 
 # Создание таблиц
@@ -83,17 +83,22 @@ class Config:
     CSV_DATA_URL = os.getenv("CSV_DATA_URL", "https://raw.githubusercontent.com/vuyq/SuzdalAI/main/suzdal_full_guide_refine/attractions.csv")
     
     # Ключевые слова
-    FOOD_KEYWORDS = ["еда", "поесть", "кафе", "ресторан", "перекусить", "кухня", "столовая", "меню"]
-    MUSEUM_KEYWORDS = ["музей", "музеи", "экспозиция", "выставка", "галерея"]
-    ATTRACTION_KEYWORDS = ["достопримечательность", "что посмотреть", "что посетить", "интересное место"]
+    FOOD_KEYWORDS = ["еда", "поесть", "кафе", "ресторан", "перекусить", "кухня", "столовая", "меню", "завтрак", "обед", "ужин"]
+    MUSEUM_KEYWORDS = ["музей", "музеи", "экспозиция", "выставка", "галерея", "коллекция"]
+    ATTRACTION_KEYWORDS = ["достопримечательность", "посмотреть", "посетить", "интересное", "место", "архитектура", "памятник"]
+    ACCOMMODATION_KEYWORDS = ["отель", "гостиница", "хостел", "номер", "жилье", "размещение", "ночлег"]
+    TRANSPORT_KEYWORDS = ["транспорт", "добраться", "автобус", "поезд", "такси", "маршрут"]
     
     # Фразы для определения уточнений
     CLARIFICATION_PHRASES = [
-        "Что для вас важнее?",
-        "Уточните, пожалуйста",
+        "что для вас важнее",
+        "уточните пожалуйста",
         "по каким критериям",
-        "Что предпочитаете?",
-        "Какой вариант выбрать?"
+        "что предпочитаете",
+        "какой вариант выбрать",
+        "какая кухня",
+        "какой бюджет",
+        "где расположение"
     ]
 
 def download_certificate():
@@ -188,7 +193,7 @@ def load_data() -> List[Document]:
                 if pd.isna(val):
                     continue
                     
-                if col.lower() in ['name', 'type', 'tags', 'address']:
+                if col.lower() in ['name', 'type', 'tags', 'address', 'price', 'hours']:
                     metadata[col.lower()] = str(val)
                 else:
                     content.append(f"{col}: {val}")
@@ -260,9 +265,21 @@ def get_dialog_context(db: Session, user_id: str, max_messages: int = 10) -> str
         for msg in messages
     )
 
-def is_clarification_request(last_response: str) -> bool:
-    """Проверяет, был ли последний ответ уточняющим вопросом"""
-    return any(phrase in last_response for phrase in Config.CLARIFICATION_PHRASES)
+def get_last_assistant_message(db: Session, user_id: str) -> Optional[str]:
+    """Получение последнего сообщения ассистента"""
+    last_message = db.query(Message).filter(
+        Message.session_id == user_id,
+        Message.role == "assistant"
+    ).order_by(Message.timestamp.desc()).first()
+    
+    return last_message.content if last_message else None
+
+def is_clarification_request(text: str) -> bool:
+    """Проверяет, является ли текст уточняющим вопросом"""
+    if not text:
+        return False
+    text_lower = text.lower()
+    return any(phrase in text_lower for phrase in Config.CLARIFICATION_PHRASES)
 
 def classify_question(question: str) -> str:
     """Классификация вопроса по категориям"""
@@ -274,73 +291,265 @@ def classify_question(question: str) -> str:
         return "museum"
     elif any(keyword in question_lower for keyword in Config.ATTRACTION_KEYWORDS):
         return "attraction"
+    elif any(keyword in question_lower for keyword in Config.ACCOMMODATION_KEYWORDS):
+        return "accommodation"
+    elif any(keyword in question_lower for keyword in Config.TRANSPORT_KEYWORDS):
+        return "transport"
     return "general"
 
-def refine_question(question: str) -> Optional[str]:
-    """Проверка необходимости уточнения вопроса"""
+def needs_clarification(question: str) -> Tuple[bool, Optional[str]]:
+    """Проверяет, нуждается ли вопрос в уточнении"""
     question = question.strip()
-    if len(question) < Config.MIN_QUESTION_LENGTH:
-        return "Пожалуйста, уточните ваш вопрос. Например:\n- Какие музеи стоит посетить?\n- Где можно попробовать медовуху?"
+    question_lower = question.lower()
     
-    question_type = classify_question(question)
+    # Очень короткие вопросы
+    if len(question) < 3:
+        return True, "Пожалуйста, уточните ваш вопрос. Например:\n- Какие музеи стоит посетить?\n- Где можно попробовать медовуху?"
     
-    if question_type == "food" and len(question.split()) < 5:
-        return (
-            "Я могу порекомендовать места по критериям:\n"
-            "- Тип кухни (русская, итальянская...)\n"
-            "- Расположение (центр, рядом с кремлем...)\n"
-            "- Бюджет (эконом, средний, премиум)\n"
-            "Что для вас важнее?"
-        )
+    # Однословные запросы
+    words = question.split()
+    if len(words) == 1:
+        word = words[0].lower()
+        if word in ["еда", "кафе", "ресторан"]:
+            return True, get_food_clarification()
+        elif word in ["музей", "музеи"]:
+            return True, get_museum_clarification()
+        elif word in ["достопримечательность", "посмотреть"]:
+            return True, get_attraction_clarification()
+        elif word in ["отель", "гостиница"]:
+            return True, get_accommodation_clarification()
+        elif word in ["транспорт", "добраться"]:
+            return True, get_transport_clarification()
     
-    return None
+    # Короткие вопросы без деталей
+    if len(words) <= 3:
+        question_type = classify_question(question)
+        if question_type == "food":
+            return True, get_food_clarification()
+        elif question_type == "museum":
+            return True, get_museum_clarification()
+        elif question_type == "attraction":
+            return True, get_attraction_clarification()
+        elif question_type == "accommodation":
+            return True, get_accommodation_clarification()
+        elif question_type == "transport":
+            return True, get_transport_clarification()
+    
+    return False, None
+
+def get_food_clarification() -> str:
+    """Уточняющий вопрос для еды"""
+    return (
+        "🍽️ Чтобы порекомендовать подходящие места, уточните:\n\n"
+        "• **Тип кухни**: русская, итальянская, европейская, азиатская?\n"
+        "• **Бюджет**: экономный, средний, премиум?\n"
+        "• **Расположение**: в центре, рядом с кремлем, на окраине?\n"
+        "• **Тип заведения**: кафе, ресторан, столовая, паб?\n\n"
+        "Что для вас важнее в первую очередь?"
+    )
+
+def get_museum_clarification() -> str:
+    """Уточняющий вопрос для музеев"""
+    return (
+        "🏛️ Уточните, какие музеи вас интересуют:\n\n"
+        "• **Исторические** - Суздальский кремль, музей деревянного зодчества\n"
+        "• **Художественные** - галереи, иконопись\n"
+        "• **Тематические** - медовухи, огурца, купеческого быта\n"
+        "• **Архитектурные** - монастыри, церкви\n\n"
+        "Что вас больше привлекает?"
+    )
+
+def get_attraction_clarification() -> str:
+    """Уточняющий вопрос для достопримечательностей"""
+    return (
+        "🏰 Уточните, что хотите посмотреть:\n\n"
+        "• **Архитектура** - кремль, монастыри, церкви\n"
+        "• **История** - древние памятники, музеи\n"
+        "• **Природа** - парки, река Каменка\n"
+        "• **Развлечения** - festivals, мастер-классы\n\n"
+        "Что вас интересует больше всего?"
+    )
+
+def get_accommodation_clarification() -> str:
+    """Уточняющий вопрос для размещения"""
+    return (
+        "🏨 Уточните параметры размещения:\n\n"
+        "• **Бюджет**: эконом, средний, luxury?\n"
+        "• **Тип**: отель, гостиница, хостел, квартира?\n"
+        "• **Расположение**: центр, тихий район, рядом с достопримечательностями?\n"
+        "• **Удобства**: WiFi, парковка, завтрак?\n\n"
+        "Что для вас наиболее важно?"
+    )
+
+def get_transport_clarification() -> str:
+    """Уточняющий вопрос для транспорта"""
+    return (
+        "🚗 Уточните, о каком транспорте:\n\n"
+        "• **До Суздаля** - из Москвы, из Владимира\n"
+        "• **Внутри города** - такси, автобусы, пешие маршруты\n"
+        "• **Аренда** - автомобили, велосипеды\n"
+        "• **Экскурсии** - организованные туры\n\n"
+        "Что именно вас интересует?"
+    )
+
+def is_user_response_to_clarification(db: Session, user_id: str, current_question: str) -> bool:
+    """Проверяет, является ли текущий вопрос ответом на уточнение"""
+    last_assistant_msg = get_last_assistant_message(db, user_id)
+    if not last_assistant_msg or not is_clarification_request(last_assistant_msg):
+        return False
+    
+    # Проверяем, что пользователь отвечает на уточнение, а не задает новый вопрос
+    current_lower = current_question.lower()
+    
+    # Если пользователь просто повторяет тот же короткий вопрос
+    if len(current_question.split()) <= 2 and classify_question(current_question) == classify_question(last_assistant_msg):
+        return True
+    
+    # Если пользователь дает конкретный ответ на уточнение
+    clarification_patterns = [
+        r"(русск|итальянск|европейск|азиатск)[а-я]* кухн",
+        r"(эконом|средн|премиум|деш[её]в|дорог)[а-я]*",
+        r"(центр|кремл|окраин)[а-я]*",
+        r"(кафе|ресторан|столов|паб|бар)[а-я]*",
+        r"(историческ|художествен|тематическ|архитектурн)[а-я]*",
+        r"(отель|гостиниц|хостел|квартир)[а-я]*",
+        r"(москв|владимир|поезд|автобус|такси|машин)[а-я]*"
+    ]
+    
+    return any(re.search(pattern, current_lower) for pattern in clarification_patterns)
+
+def generate_clarified_response(db: Session, user_id: str, clarification: str) -> str:
+    """Генерация ответа на уточняющую информацию"""
+    try:
+        # Получаем последний уточняющий вопрос
+        last_clarification = get_last_assistant_message(db, user_id)
+        
+        # Ищем первоначальный запрос (перед уточнением)
+        user_messages = db.query(Message).filter(
+            Message.session_id == user_id,
+            Message.role == "user"
+        ).order_by(Message.timestamp.desc()).all()
+        
+        original_question = None
+        for msg in user_messages:
+            if not is_clarification_request(msg.content):
+                original_question = msg.content
+                break
+        
+        if not original_question:
+            # Если не нашли оригинальный вопрос, используем уточнение как основной запрос
+            combined_query = clarification
+        else:
+            # Комбинируем оригинальный вопрос и уточнение
+            combined_query = f"{original_question} {clarification}"
+        
+        # Поиск в базе знаний
+        docs = document_retriever.invoke(combined_query)
+        
+        if docs:
+            question_type = classify_question(combined_query)
+            if question_type == "food":
+                return format_food_response(docs)
+            elif question_type == "museum":
+                return format_museum_response(docs)
+            elif question_type == "attraction":
+                return format_attraction_response(docs)
+            else:
+                return format_general_response(docs, combined_query)
+        
+        # Если в базе нет результатов - ищем в интернете
+        web_results = perform_web_search(combined_query)
+        if "Не найдено" not in web_results:
+            return f"Вот что я нашел в интернете по вашему запросу:\n\n{web_results}"
+        
+        return "К сожалению, не нашел конкретной информации по вашим критериям. Попробуйте изменить параметры поиска или задайте вопрос по-другому."
+    
+    except Exception as e:
+        logger.error(f"Ошибка генерации уточненного ответа: {e}")
+        return "Не удалось обработать ваш запрос. Пожалуйста, попробуйте еще раз."
 
 def format_food_response(docs: List[Document]) -> str:
     """Форматирование ответа о местах питания"""
     if not docs:
         return "К сожалению, не нашел подходящих мест по вашему запросу."
     
-    response = ["🍽️ Вот варианты где можно поесть:"]
-    for doc in docs[:5]:
+    response = ["🍽️ **Рекомендую следующие места:**\n"]
+    for i, doc in enumerate(docs[:5], 1):
         name = doc.metadata.get("name", "Заведение")
         cuisine = doc.metadata.get("type", "кухня не указана")
         address = doc.metadata.get("address", "адрес не указан")
-        response.append(f"\n• {name} ({cuisine})\n  📍 {address}")
+        price = doc.metadata.get("price", "")
+        
+        response.append(f"{i}. **{name}**")
+        response.append(f"   🍳 Кухня: {cuisine}")
+        if price:
+            response.append(f"   💰 Цены: {price}")
+        if address:
+            response.append(f"   📍 Адрес: {address}")
+        response.append("")
+    
+    response.append("Рекомендую уточнить часы работы по телефону перед посещением!")
+    return "\n".join(response)
+
+def format_museum_response(docs: List[Document]) -> str:
+    """Форматирование ответа о музеях"""
+    if not docs:
+        return "К сожалению, не нашел информации о музеях по вашему запросу."
+    
+    response = ["🏛️ **Музеи Суздаля:**\n"]
+    for i, doc in enumerate(docs[:5], 1):
+        name = doc.metadata.get("name", "Музей")
+        description = doc.page_content[:150] + "..." if len(doc.page_content) > 150 else doc.page_content
+        address = doc.metadata.get("address", "")
+        hours = doc.metadata.get("hours", "")
+        
+        response.append(f"{i}. **{name}**")
+        response.append(f"   📖 {description}")
+        if address:
+            response.append(f"   📍 {address}")
+        if hours:
+            response.append(f"   🕒 {hours}")
+        response.append("")
     
     return "\n".join(response)
 
-def generate_clarified_response(db: Session, user_id: str, clarification: str) -> str:
-    """Генерация ответа на уточняющую информацию"""
-    try:
-        # Получаем весь контекст диалога
-        context = get_dialog_context(db, user_id)
-        
-        # Ищем первоначальный запрос (перед уточнением)
-        original_message = db.query(Message).filter(
-            Message.session_id == user_id,
-            Message.role == "user"
-        ).order_by(Message.timestamp.desc()).offset(1).first()
-        
-        if not original_message:
-            return format_food_response(document_retriever.invoke(clarification))
-        
-        # Комбинируем оригинальный вопрос и уточнение
-        combined_query = f"{original_message.content} {clarification}"
-        docs = document_retriever.invoke(combined_query)
-        
-        if docs:
-            return format_food_response(docs)
-        
-        # Если в базе нет результатов - ищем в интернете
-        web_results = perform_web_search(combined_query)
-        if "Не найдено" not in web_results:
-            return f"Вот что я нашел в интернете:\n{web_results}"
-        
-        return "К сожалению, не нашел вариантов по вашим критериям. Попробуйте изменить параметры поиска."
+def format_attraction_response(docs: List[Document]) -> str:
+    """Форматирование ответа о достопримечательностях"""
+    if not docs:
+        return "К сожалению, не нашел достопримечательностей по вашему запросу."
     
-    except Exception as e:
-        logger.error(f"Ошибка генерации уточненного ответа: {e}")
-        return "Не удалось обработать ваш запрос. Пожалуйста, попробуйте еще раз."
+    response = ["🏰 **Достопримечательности:**\n"]
+    for i, doc in enumerate(docs[:5], 1):
+        name = doc.metadata.get("name", "Достопримечательность")
+        description = doc.page_content[:120] + "..." if len(doc.page_content) > 120 else doc.page_content
+        address = doc.metadata.get("address", "")
+        
+        response.append(f"{i}. **{name}**")
+        response.append(f"   📖 {description}")
+        if address:
+            response.append(f"   📍 {address}")
+        response.append("")
+    
+    return "\n".join(response)
+
+def format_general_response(docs: List[Document], query: str) -> str:
+    """Форматирование общего ответа"""
+    if not docs:
+        return f"К сожалению, не нашел информации по запросу '{query}'."
+    
+    response = [f"**Результаты по запросу '{query}':**\n"]
+    for i, doc in enumerate(docs[:5], 1):
+        name = doc.metadata.get("name", "Место")
+        description = doc.page_content[:100] + "..." if len(doc.page_content) > 100 else doc.page_content
+        address = doc.metadata.get("address", "")
+        
+        response.append(f"{i}. **{name}**")
+        response.append(f"   {description}")
+        if address:
+            response.append(f"   📍 {address}")
+        response.append("")
+    
+    return "\n".join(response)
 
 TOURISM_PROMPT_TEMPLATE = """
 Ты виртуальный гид по Суздалю. Отвечай на вопросы информативно и дружелюбно.
@@ -357,23 +566,8 @@ TOURISM_PROMPT_TEMPLATE = """
 [Вопрос]:
 {question}
 
-Сформируй ответ по правилам:
-1. Для заведений питания укажи:
-   - Название и тип кухни
-   - Средний чек (если есть)
-   - Адрес и особенности
-
-2. Для музеев укажи:
-   - Название и описание
-   - Часы работы и стоимость
-   - Интересные факты
-
-3. Для других мест:
-   - Краткое описание
-   - Почему стоит посетить
-   - Как добраться
-
-Будь вежлив и предлагай уточнения если нужно.
+Ответь подробно и полезно, предлагая конкретные рекомендации.
+Если информации недостаточно - вежливо предложи уточнить запрос.
 """
 
 tourism_prompt = PromptTemplate.from_template(TOURISM_PROMPT_TEMPLATE)
@@ -384,7 +578,7 @@ def generate_ai_response(question: str, context_docs: List[Document],
     try:
         prompt_input = {
             "question": question,
-            "context": "\n\n".join(d.page_content for d in context_docs) if context_docs else "Нет данных",
+            "context": "\n\n".join(d.page_content for d in context_docs) if context_docs else "Нет данных в базе",
             "web_search": web_results,
             "dialog_context": dialog_context
         }
@@ -394,7 +588,7 @@ def generate_ai_response(question: str, context_docs: List[Document],
     
     except Exception as e:
         logger.error(f"Ошибка генерации ответа: {e}")
-        return format_food_response(context_docs) if classify_question(question) == "food" else "Не удалось обработать запрос"
+        return "Не удалось обработать запрос с помощью AI. Вот что я нашел:\n" + format_general_response(context_docs, question)
 
 def handle_question(db: Session, question: str, user_id: str) -> str:
     """Основная обработка вопроса"""
@@ -403,38 +597,28 @@ def handle_question(db: Session, question: str, user_id: str) -> str:
         if not question:
             return "Пожалуйста, задайте ваш вопрос о Суздале."
         
-        # Получаем предыдущий контекст
-        dialog_context = get_dialog_context(db, user_id)
-        
-        # Получаем последний ответ ассистента
-        last_message = db.query(Message).filter(
-            Message.session_id == user_id,
-            Message.role == "assistant"
-        ).order_by(Message.timestamp.desc()).first()
-        
-        last_response = last_message.content if last_message else ""
-        
-        # Проверяем, является ли текущий вопрос ответом на уточнение
-        if is_clarification_request(last_response):
+        # Проверяем, является ли это ответом на уточнение
+        if is_user_response_to_clarification(db, user_id, question):
             response = generate_clarified_response(db, user_id, question)
             update_dialog_context(db, user_id, "assistant", response)
             return response
         
-        # Проверка необходимости уточнения
-        refinement = refine_question(question)
-        if refinement:
-            update_dialog_context(db, user_id, "assistant", refinement)
-            return refinement
+        # Проверяем, нуждается ли вопрос в уточнении
+        needs_clarify, clarification_text = needs_clarification(question)
+        if needs_clarify:
+            update_dialog_context(db, user_id, "user", question)
+            update_dialog_context(db, user_id, "assistant", clarification_text)
+            return clarification_text
         
-        # Классификация вопроса
-        question_type = classify_question(question)
+        # Получаем предыдущий контекст
+        dialog_context = get_dialog_context(db, user_id)
         
         # Поиск в базе знаний
         context_docs = document_retriever.invoke(question)
         
         # Формирование ответа
         if context_docs:
-            web_results = perform_web_search(question) if len(context_docs) < 2 else ""
+            web_results = perform_web_search(question) if len(context_docs) < 3 else ""
             response = generate_ai_response(question, context_docs, web_results, dialog_context)
         else:
             web_results = perform_web_search(question)
@@ -463,10 +647,12 @@ try:
     document_retriever = vector_store.as_retriever(
         search_kwargs={"k": Config.RETRIEVER_K}
     )
+    logger.info("Модели и данные успешно инициализированы")
     
 except Exception as e:
     logger.critical(f"Ошибка инициализации: {e}")
-    raise
+    # Создаем заглушки для продолжения работы
+    documents = []
 
 app = FastAPI(title="Суздаль Tourism Assistant")
 
