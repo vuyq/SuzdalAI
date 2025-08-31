@@ -11,3 +11,5 @@ langchain-gigachat
 faiss-cpu
 ddgs>=2.0.0
 duckduckgo-search
+sqlalchemy
+psycopg2-binary
