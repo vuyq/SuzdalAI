@@ -3,8 +3,13 @@ import requests
 import pandas as pd
 from pathlib import Path
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import create_engine, Column, String, Text, DateTime, Integer
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.dialects.postgresql import JSON
+from datetime import datetime
 from pydantic import BaseModel
 from langchain_core.documents import Document
 from langchain_gigachat import GigaChat, GigaChatEmbeddings
@@ -14,7 +19,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 from ddgs import DDGS
 import logging
 from typing import Dict, List, Optional, Tuple
-from datetime import datetime
+import uuid
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -22,6 +27,44 @@ logger = logging.getLogger(__name__)
 
 # Загрузка переменных окружения
 load_dotenv()
+
+# Настройки базы данных
+DATABASE_URL = os.getenv("DATABASE_URL")
+if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+# Модели базы данных
+class ChatSession(Base):
+    __tablename__ = "chat_sessions"
+    
+    id = Column(String(100), primary_key=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+class Message(Base):
+    __tablename__ = "messages"
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    session_id = Column(String(100), nullable=False)
+    role = Column(String(10), nullable=False)
+    content = Column(Text, nullable=False)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+    metadata = Column(JSON, nullable=True)
+
+# Создание таблиц
+Base.metadata.create_all(bind=engine)
+
+# Dependency для получения сессии БД
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 class Config:
     # Основные настройки
@@ -52,12 +95,9 @@ class Config:
         "Какой вариант выбрать?"
     ]
 
-# Глобальное хранилище контекста
-DIALOG_CONTEXTS: Dict[str, List[Dict[str, str]]] = {}
-
 def download_certificate():
     """Загрузка SSL-сертификата при необходимости"""
-    if not Path(Config.CERT_PATH).exists():
+    if Config.CERT_URL and not Path(Config.CERT_PATH).exists():
         try:
             response = requests.get(Config.CERT_URL, timeout=Config.REQUEST_TIMEOUT)
             response.raise_for_status()
@@ -76,7 +116,7 @@ def get_gigachat_token() -> str:
     headers = {
         'Content-Type': 'application/x-www-form-urlencoded',
         'Accept': 'application/json',
-        'RqUID': 'a2231e67-570e-47ca-bae8-82ca565850eb',
+        'RqUID': str(uuid.uuid4()),
         'Authorization': f'Basic {Config.GIGACHAT_AUTH}'
     }
     payload = {'scope': 'GIGACHAT_API_PERS'}
@@ -105,17 +145,17 @@ def initialize_models() -> Tuple[GigaChatEmbeddings, GigaChat]:
             access_token=access_token,
             model="Embeddings",
             scope="GIGACHAT_API_PERS",
-            verify_ssl_certs=True,
-            ca_bundle_file=Config.CERT_PATH,
+            verify_ssl_certs=bool(Config.CERT_PATH),
+            ca_bundle_file=Config.CERT_PATH if Config.CERT_PATH and Path(Config.CERT_PATH).exists() else None,
             timeout=Config.REQUEST_TIMEOUT
         )
         
         ai_assistant = GigaChat(
             access_token=access_token,
-            model="GigaChat-2",
+            model="GigaChat",
             temperature=0.2,
-            verify_ssl_certs=True,
-            ca_bundle_file=Config.CERT_PATH,
+            verify_ssl_certs=bool(Config.CERT_PATH),
+            ca_bundle_file=Config.CERT_PATH if Config.CERT_PATH and Path(Config.CERT_PATH).exists() else None,
             timeout=Config.REQUEST_TIMEOUT,
             verbose=True
         )
@@ -182,24 +222,41 @@ def perform_web_search(query: str) -> str:
         logger.error(f"Ошибка веб-поиска: {e}")
         return "Ошибка при выполнении поиска"
 
-def update_dialog_context(user_id: str, role: str, message: str):
-    """Обновление контекста диалога"""
-    if user_id not in DIALOG_CONTEXTS:
-        DIALOG_CONTEXTS[user_id] = []
+def update_dialog_context(db: Session, user_id: str, role: str, message: str):
+    """Обновление контекста диалога в базе данных"""
+    # Проверяем существование сессии
+    session = db.query(ChatSession).filter(ChatSession.id == user_id).first()
+    if not session:
+        session = ChatSession(id=user_id)
+        db.add(session)
+        db.commit()
     
-    DIALOG_CONTEXTS[user_id].append({"role": role, "message": message, "timestamp": datetime.now().isoformat()})
-    
-    if len(DIALOG_CONTEXTS[user_id]) > Config.MAX_CONTEXT_LENGTH:
-        DIALOG_CONTEXTS[user_id] = DIALOG_CONTEXTS[user_id][-Config.MAX_CONTEXT_LENGTH:]
+    # Добавляем сообщение
+    db_message = Message(
+        session_id=user_id,
+        role=role,
+        content=message,
+        timestamp=datetime.utcnow()
+    )
+    db.add(db_message)
+    db.commit()
 
-def get_dialog_context(user_id: str) -> str:
-    """Получение форматированного контекста диалога"""
-    if user_id not in DIALOG_CONTEXTS or not DIALOG_CONTEXTS[user_id]:
+def get_dialog_context(db: Session, user_id: str, max_messages: int = 10) -> str:
+    """Получение форматированного контекста диалога из базы данных"""
+    messages = db.query(Message).filter(
+        Message.session_id == user_id
+    ).order_by(
+        Message.timestamp.desc()
+    ).limit(max_messages).all()
+    
+    if not messages:
         return ""
     
+    # Переворачиваем порядок для хронологического вывода
+    messages.reverse()
     return "\n".join(
-        f"{item['role']}: {item['message']}" 
-        for item in DIALOG_CONTEXTS[user_id]
+        f"{msg.role}: {msg.content}" 
+        for msg in messages
     )
 
 def is_clarification_request(last_response: str) -> bool:
@@ -218,7 +275,7 @@ def classify_question(question: str) -> str:
         return "attraction"
     return "general"
 
-def refine_question(question: str, user_id: str) -> Optional[str]:
+def refine_question(question: str) -> Optional[str]:
     """Проверка необходимости уточнения вопроса"""
     question = question.strip()
     if len(question) < Config.MIN_QUESTION_LENGTH:
@@ -251,24 +308,23 @@ def format_food_response(docs: List[Document]) -> str:
     
     return "\n".join(response)
 
-def generate_clarified_response(user_id: str, clarification: str) -> str:
+def generate_clarified_response(db: Session, user_id: str, clarification: str) -> str:
     """Генерация ответа на уточняющую информацию"""
     try:
         # Получаем весь контекст диалога
-        context = get_dialog_context(user_id)
+        context = get_dialog_context(db, user_id)
         
         # Ищем первоначальный запрос (перед уточнением)
-        original_question = ""
-        for msg in DIALOG_CONTEXTS.get(user_id, []):
-            if msg["role"] == "user" and not is_clarification_request(msg.get("message", "")):
-                original_question = msg["message"]
-                break
+        original_message = db.query(Message).filter(
+            Message.session_id == user_id,
+            Message.role == "user"
+        ).order_by(Message.timestamp.desc()).offset(1).first()
         
-        if not original_question:
+        if not original_message:
             return format_food_response(document_retriever.invoke(clarification))
         
         # Комбинируем оригинальный вопрос и уточнение
-        combined_query = f"{original_question} {clarification}"
+        combined_query = f"{original_message.content} {clarification}"
         docs = document_retriever.invoke(combined_query)
         
         if docs:
@@ -339,7 +395,7 @@ def generate_ai_response(question: str, context_docs: List[Document],
         logger.error(f"Ошибка генерации ответа: {e}")
         return format_food_response(context_docs) if classify_question(question) == "food" else "Не удалось обработать запрос"
 
-def handle_question(question: str, user_id: str) -> str:
+def handle_question(db: Session, question: str, user_id: str) -> str:
     """Основная обработка вопроса"""
     try:
         question = question.strip()
@@ -347,19 +403,26 @@ def handle_question(question: str, user_id: str) -> str:
             return "Пожалуйста, задайте ваш вопрос о Суздале."
         
         # Получаем предыдущий контекст
-        dialog_context = get_dialog_context(user_id)
-        last_response = DIALOG_CONTEXTS.get(user_id, [{}])[-1].get("message", "") if DIALOG_CONTEXTS.get(user_id) else ""
+        dialog_context = get_dialog_context(db, user_id)
+        
+        # Получаем последний ответ ассистента
+        last_message = db.query(Message).filter(
+            Message.session_id == user_id,
+            Message.role == "assistant"
+        ).order_by(Message.timestamp.desc()).first()
+        
+        last_response = last_message.content if last_message else ""
         
         # Проверяем, является ли текущий вопрос ответом на уточнение
         if is_clarification_request(last_response):
-            response = generate_clarified_response(user_id, question)
-            update_dialog_context(user_id, "assistant", response)
+            response = generate_clarified_response(db, user_id, question)
+            update_dialog_context(db, user_id, "assistant", response)
             return response
         
         # Проверка необходимости уточнения
-        refinement = refine_question(question, user_id)
+        refinement = refine_question(question)
         if refinement:
-            update_dialog_context(user_id, "assistant", refinement)
+            update_dialog_context(db, user_id, "assistant", refinement)
             return refinement
         
         # Классификация вопроса
@@ -377,8 +440,8 @@ def handle_question(question: str, user_id: str) -> str:
             response = generate_ai_response(question, [], web_results, dialog_context)
         
         # Сохраняем контекст
-        update_dialog_context(user_id, "user", question)
-        update_dialog_context(user_id, "assistant", response)
+        update_dialog_context(db, user_id, "user", question)
+        update_dialog_context(db, user_id, "assistant", response)
         
         return response
     
@@ -419,12 +482,12 @@ class Question(BaseModel):
     user_id: str = "default"
 
 @app.post("/ask")
-async def ask(item: Question):
+async def ask(item: Question, db: Session = Depends(get_db)):
     try:
         if not item.question.strip():
             return {"answer": "Пожалуйста, задайте ваш вопрос."}
         
-        response = handle_question(item.question, item.user_id)
+        response = handle_question(db, item.question, item.user_id)
         return {"answer": response}
     
     except Exception as e:
@@ -433,6 +496,10 @@ async def ask(item: Question):
             status_code=500,
             detail="Внутренняя ошибка сервера. Пожалуйста, попробуйте позже."
         )
+
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy", "timestamp": datetime.utcnow()}
 
 if __name__ == "__main__":
     import uvicorn
