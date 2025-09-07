@@ -5,9 +5,9 @@ from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import create_engine, Column, String, Text, DateTime, Integer
+from sqlalchemy import create_engine, Column, String, Text, DateTime, Integer, ForeignKey, Index
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.orm import sessionmaker, Session, relationship
 from sqlalchemy.dialects.postgresql import JSON
 from datetime import datetime
 from pydantic import BaseModel
@@ -45,16 +45,23 @@ class ChatSession(Base):
     id = Column(String(100), primary_key=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    messages = relationship("Message", back_populates="session", cascade="all, delete-orphan")
 
 class Message(Base):
     __tablename__ = "messages"
     
     id = Column(Integer, primary_key=True, autoincrement=True)
-    session_id = Column(String(100), nullable=False)
+    session_id = Column(String(100), ForeignKey("chat_sessions.id"), nullable=False)
     role = Column(String(10), nullable=False)
     content = Column(Text, nullable=False)
     timestamp = Column(DateTime, default=datetime.utcnow)
     message_metadata = Column(JSON, nullable=True)
+    session = relationship("ChatSession", back_populates="messages")
+
+# Создание индексов для улучшения производительности
+Index('ix_messages_session_id', Message.session_id)
+Index('ix_messages_timestamp', Message.timestamp)
+Index('ix_messages_session_role', Message.session_id, Message.role)
 
 # Создание таблиц
 Base.metadata.create_all(bind=engine)
@@ -74,7 +81,8 @@ class Config:
     MIN_QUESTION_LENGTH = 2
     SEARCH_RESULTS = 3
     RETRIEVER_K = 5
-    MAX_CONTEXT_LENGTH = 10
+    MAX_CONTEXT_LENGTH = 20
+    MAX_MESSAGES_TO_KEEP = 50
     
     # Пути и URL
     CERT_PATH = os.getenv("CERT_PATH", "./cert.pem")
@@ -230,49 +238,103 @@ def perform_web_search(query: str) -> str:
 
 def update_dialog_context(db: Session, user_id: str, role: str, message: str):
     """Обновление контекста диалога в базе данных"""
-    # Проверяем существование сессии
-    session = db.query(ChatSession).filter(ChatSession.id == user_id).first()
-    if not session:
-        session = ChatSession(id=user_id)
-        db.add(session)
+    try:
+        # Проверяем существование сессии
+        session = db.query(ChatSession).filter(ChatSession.id == user_id).first()
+        if not session:
+            session = ChatSession(id=user_id)
+            db.add(session)
+            db.commit()
+            db.refresh(session)
+        
+        # Добавляем сообщение
+        db_message = Message(
+            session_id=user_id,
+            role=role,
+            content=message,
+            timestamp=datetime.utcnow()
+        )
+        db.add(db_message)
         db.commit()
-    
-    # Добавляем сообщение
-    db_message = Message(
-        session_id=user_id,
-        role=role,
-        content=message,
-        timestamp=datetime.utcnow()
-    )
-    db.add(db_message)
-    db.commit()
+        db.refresh(db_message)
+        
+        logger.info(f"Сохранили сообщение для сессии {user_id}: {role} - {message[:100]}...")
+        
+    except Exception as e:
+        logger.error(f"Ошибка обновления контекста: {e}")
+        db.rollback()
+        raise
 
 def get_dialog_context(db: Session, user_id: str, max_messages: int = 10) -> str:
     """Получение форматированного контекста диалога из базы данных"""
-    messages = db.query(Message).filter(
-        Message.session_id == user_id
-    ).order_by(
-        Message.timestamp.desc()
-    ).limit(max_messages).all()
+    try:
+        # Проверяем существование сессии
+        session = db.query(ChatSession).filter(ChatSession.id == user_id).first()
+        if not session:
+            return ""
+        
+        messages = db.query(Message).filter(
+            Message.session_id == user_id
+        ).order_by(
+            Message.timestamp.asc()  # Хронологический порядок
+        ).limit(max_messages).all()
+        
+        if not messages:
+            return ""
+        
+        context = "\n".join(
+            f"{msg.role}: {msg.content}" 
+            for msg in messages
+        )
+        
+        logger.info(f"Получен контекст для {user_id}: {len(messages)} сообщений")
+        return context
     
-    if not messages:
+    except Exception as e:
+        logger.error(f"Ошибка получения контекста: {e}")
         return ""
+
+def cleanup_old_messages(db: Session, user_id: str, keep_last: int = Config.MAX_MESSAGES_TO_KEEP):
+    """Очистка старых сообщений для предотвращения переполнения"""
+    try:
+        # Получаем общее количество сообщений
+        total_count = db.query(Message).filter(Message.session_id == user_id).count()
+        
+        if total_count > keep_last:
+            # Находим ID сообщений, которые нужно сохранить (последние keep_last)
+            recent_messages = db.query(Message.id).filter(
+                Message.session_id == user_id
+            ).order_by(
+                Message.timestamp.desc()
+            ).limit(keep_last).all()
+            
+            recent_ids = [msg.id for msg in recent_messages]
+            
+            # Удаляем старые сообщения
+            deleted_count = db.query(Message).filter(
+                Message.session_id == user_id,
+                Message.id.notin_(recent_ids)
+            ).delete(synchronize_session=False)
+            
+            db.commit()
+            logger.info(f"Удалено {deleted_count} старых сообщений для сессии {user_id}")
     
-    # Переворачиваем порядок для хронологического вывода
-    messages.reverse()
-    return "\n".join(
-        f"{msg.role}: {msg.content}" 
-        for msg in messages
-    )
+    except Exception as e:
+        logger.error(f"Ошибка очистки сообщений: {e}")
+        db.rollback()
 
 def get_last_assistant_message(db: Session, user_id: str) -> Optional[str]:
     """Получение последнего сообщения ассистента"""
-    last_message = db.query(Message).filter(
-        Message.session_id == user_id,
-        Message.role == "assistant"
-    ).order_by(Message.timestamp.desc()).first()
-    
-    return last_message.content if last_message else None
+    try:
+        last_message = db.query(Message).filter(
+            Message.session_id == user_id,
+            Message.role == "assistant"
+        ).order_by(Message.timestamp.desc()).first()
+        
+        return last_message.content if last_message else None
+    except Exception as e:
+        logger.error(f"Ошибка получения последнего сообщения: {e}")
+        return None
 
 def is_clarification_request(text: str) -> bool:
     """Проверяет, является ли текст уточняющим вопросом"""
@@ -597,21 +659,26 @@ def handle_question(db: Session, question: str, user_id: str) -> str:
         if not question:
             return "Пожалуйста, задайте ваш вопрос о Суздале."
         
+        # Сохраняем вопрос пользователя
+        update_dialog_context(db, user_id, "user", question)
+        
         # Проверяем, является ли это ответом на уточнение
         if is_user_response_to_clarification(db, user_id, question):
             response = generate_clarified_response(db, user_id, question)
             update_dialog_context(db, user_id, "assistant", response)
+            cleanup_old_messages(db, user_id)
             return response
         
         # Проверяем, нуждается ли вопрос в уточнении
         needs_clarify, clarification_text = needs_clarification(question)
         if needs_clarify:
-            update_dialog_context(db, user_id, "user", question)
             update_dialog_context(db, user_id, "assistant", clarification_text)
+            cleanup_old_messages(db, user_id)
             return clarification_text
         
         # Получаем предыдущий контекст
         dialog_context = get_dialog_context(db, user_id)
+        logger.info(f"Диалоговый контекст для {user_id}: {len(dialog_context.splitlines())} сообщений")
         
         # Поиск в базе знаний
         context_docs = document_retriever.invoke(question)
@@ -624,9 +691,9 @@ def handle_question(db: Session, question: str, user_id: str) -> str:
             web_results = perform_web_search(question)
             response = generate_ai_response(question, [], web_results, dialog_context)
         
-        # Сохраняем контекст
-        update_dialog_context(db, user_id, "user", question)
+        # Сохраняем ответ ассистента
         update_dialog_context(db, user_id, "assistant", response)
+        cleanup_old_messages(db, user_id)
         
         return response
     
@@ -687,6 +754,54 @@ async def ask(item: Question, db: Session = Depends(get_db)):
 @app.get("/health")
 async def health_check():
     return {"status": "healthy", "timestamp": datetime.utcnow()}
+
+@app.get("/history/{user_id}")
+async def get_history(user_id: str, db: Session = Depends(get_db)):
+    """Получить историю сообщений для пользователя"""
+    try:
+        messages = db.query(Message).filter(
+            Message.session_id == user_id
+        ).order_by(Message.timestamp.asc()).all()
+        
+        return {
+            "user_id": user_id,
+            "message_count": len(messages),
+            "messages": [
+                {
+                    "role": msg.role,
+                    "content": msg.content,
+                    "timestamp": msg.timestamp.isoformat()
+                }
+                for msg in messages
+            ]
+        }
+    
+    except Exception as e:
+        logger.error(f"Ошибка получения истории: {e}")
+        raise HTTPException(status_code=500, detail="Ошибка получения истории")
+
+@app.delete("/history/{user_id}")
+async def clear_history(user_id: str, db: Session = Depends(get_db)):
+    """Очистить историю сообщений для пользователя"""
+    try:
+        # Удаляем все сообщения пользователя
+        message_count = db.query(Message).filter(Message.session_id == user_id).delete()
+        
+        # Удаляем сессию
+        session_count = db.query(ChatSession).filter(ChatSession.id == user_id).delete()
+        
+        db.commit()
+        
+        return {
+            "user_id": user_id,
+            "deleted_messages": message_count,
+            "deleted_sessions": session_count
+        }
+    
+    except Exception as e:
+        logger.error(f"Ошибка очистки истории: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Ошибка очистки истории")
 
 if __name__ == "__main__":
     import uvicorn
