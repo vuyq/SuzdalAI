@@ -45,6 +45,7 @@ class ChatSession(Base):
     id = Column(String(100), primary_key=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    last_question = Column(Text, nullable=True)  # ✅ сохраняем последний вопрос
     messages = relationship("Message", back_populates="session", cascade="all, delete-orphan")
 
 class Message(Base):
@@ -220,6 +221,16 @@ def update_dialog_context(db: Session, user_id: str, role: str, message: str):
     db.add(db_message)
     db.commit()
 
+def set_last_question(db: Session, user_id: str, question: str):
+    session = db.query(ChatSession).filter(ChatSession.id == user_id).first()
+    if session:
+        session.last_question = question
+        db.commit()
+
+def get_last_question(db: Session, user_id: str) -> str:
+    session = db.query(ChatSession).filter(ChatSession.id == user_id).first()
+    return session.last_question if session else None
+
 def get_dialog_context(db: Session, user_id: str, max_messages: int = 10) -> str:
     messages = db.query(Message).filter(Message.session_id == user_id).order_by(Message.timestamp.asc()).limit(max_messages).all()
     return "\n".join(f"{msg.role}: {msg.content}" for msg in messages)
@@ -227,15 +238,24 @@ def get_dialog_context(db: Session, user_id: str, max_messages: int = 10) -> str
 # 🔹 Проверка на необходимость уточнения
 def needs_clarification(question: str) -> Tuple[bool, str]:
     q = question.lower()
-    if any(word in q for word in ["где поесть", "что посетить", "куда сходить", "достопримечательности", "музеи", "рестораны"]):
+
+    if "рестора" in q or "поесть" in q or "кухн" in q:
         return True, (
-            "Можете уточнить, что для вас важнее?\n"
-            "- бюджет\n"
-            "- тип кухни или место\n"
-            "- расположение\n"
-            "- время работы\n\n"
-            "Это поможет мне подобрать лучший вариант."
+            "Вы ищете ресторан. Можете уточнить:\n"
+            "- Какой тип кухни предпочитаете (русская, японская, китайская, европейская)?\n"
+            "- Важно ли расположение (центр, окраина, рядом с достопримечательностями)?\n"
+            "- Нужен ли бюджетный вариант или премиум?"
         )
+
+    if any(word in q for word in ["достопримечательности", "музеи", "куда сходить", "что посетить"]):
+        return True, (
+            "Вы ищете достопримечательности. Хотите больше про:\n"
+            "- Исторические объекты\n"
+            "- Музеи\n"
+            "- Храмы и монастыри\n"
+            "- Природные места"
+        )
+
     return False, ""
 
 # 🔹 Форматирование найденных данных
@@ -270,27 +290,40 @@ def handle_question(db: Session, question: str, user_id: str) -> str:
     update_dialog_context(db, user_id, "user", question)
     dialog_context = get_dialog_context(db, user_id)
 
+    # Проверка: пользователь сказал "да, ищи в интернете"
+    if question.lower() in ["да", "ищи", "да, ищи", "в интернете", "давай интернет"]:
+        last_q = get_last_question(db, user_id)
+        if last_q:
+            web_results = perform_web_search(last_q)
+            response = f"🌐 Вот что удалось найти в интернете по вашему запросу «{last_q}»:\n\n{web_results}"
+            update_dialog_context(db, user_id, "assistant", response)
+            return response
+
     # 1. Проверка на необходимость уточнения
     needs_clarify, clarification_text = needs_clarification(question)
     if needs_clarify:
         update_dialog_context(db, user_id, "assistant", clarification_text)
         return clarification_text
 
-    # 2. Поиск в базе
+    # 2. Поиск в базе (RAG)
     context_docs = document_retriever.invoke(question)
 
     if context_docs:
         formatted_context = format_context_docs(context_docs)
         ai_answer = generate_ai_response(question, context_docs, "", dialog_context)
-        response = f"📚 Вот что я нашёл в базе:\n\n{formatted_context}\n\n🤖 {ai_answer}"
-        if len(context_docs) < 3:
-            response += "\n\n🤔 В базе мало информации. Хотите, я попробую поискать ещё и в интернете?"
+
+        set_last_question(db, user_id, question)  # ✅ сохранили вопрос
+
+        response = (
+            f"📚 Вот что я нашёл в базе:\n\n{formatted_context}\n\n"
+            f"🤖 {ai_answer}\n\n"
+            "Хотите, я дополнительно поищу информацию в интернете?"
+        )
+
     else:
-        if any(word in question.lower() for word in ["да", "ищи", "интернет"]):
-            web_results = perform_web_search(question)
-            response = f"🌐 Вот что удалось найти в интернете:\n\n{web_results}"
-        else:
-            response = "К сожалению, в базе нет информации. Хотите, я попробую поискать в интернете?"
+        # Если в базе ничего нет → сразу ищем в интернете
+        web_results = perform_web_search(question)
+        response = f"🌐 В базе ничего не найдено. Вот что удалось найти в интернете:\n\n{web_results}"
 
     update_dialog_context(db, user_id, "assistant", response)
     return response
@@ -331,4 +364,3 @@ async def health_check():
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8001)
-
