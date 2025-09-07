@@ -17,19 +17,19 @@ from langchain_community.vectorstores import FAISS
 from langchain_core.prompts import PromptTemplate
 from tenacity import retry, stop_after_attempt, wait_exponential
 from ddgs import DDGS
+from rapidfuzz import process, fuzz
 import logging
 from typing import List, Tuple
 import uuid
 import uvicorn
 
-# Настройка логирования
+# Логирование
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Загрузка переменных окружения
+# Переменные окружения
 load_dotenv()
 
-# Настройки базы данных
 DATABASE_URL = os.getenv("DATABASE_URL")
 if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
@@ -41,16 +41,14 @@ Base = declarative_base()
 # Модели базы данных
 class ChatSession(Base):
     __tablename__ = "chat_sessions"
-    
     id = Column(String(100), primary_key=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    last_question = Column(Text, nullable=True)  # ✅ сохраняем последний вопрос
+    last_question = Column(Text, nullable=True)
     messages = relationship("Message", back_populates="session", cascade="all, delete-orphan")
 
 class Message(Base):
     __tablename__ = "messages"
-    
     id = Column(Integer, primary_key=True, autoincrement=True)
     session_id = Column(String(100), ForeignKey("chat_sessions.id"), nullable=False)
     role = Column(String(10), nullable=False)
@@ -67,7 +65,7 @@ Index('ix_messages_session_role', Message.session_id, Message.role)
 # Создание таблиц
 Base.metadata.create_all(bind=engine)
 
-# Dependency для БД
+# Dependency
 def get_db():
     db = SessionLocal()
     try:
@@ -88,6 +86,7 @@ class Config:
         "https://raw.githubusercontent.com/vuyq/SuzdalAI/main/suzdal_full_guide_refine/attractions.csv"
     )
 
+# Загрузка сертификата
 def download_certificate():
     if Config.CERT_URL and not Path(Config.CERT_PATH).exists():
         try:
@@ -100,6 +99,7 @@ def download_certificate():
             logger.error(f"Ошибка загрузки сертификата: {e}")
             raise
 
+# Получение токена GigaChat
 @retry(stop=stop_after_attempt(Config.MAX_RETRIES), wait=wait_exponential(multiplier=1, min=2, max=10))
 def get_gigachat_token() -> str:
     url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
@@ -110,7 +110,6 @@ def get_gigachat_token() -> str:
         'Authorization': f'Basic {Config.GIGACHAT_AUTH}'
     }
     payload = {'scope': 'GIGACHAT_API_PERS'}
-    
     response = requests.post(
         url, headers=headers, data=payload,
         verify=Config.CERT_PATH, timeout=Config.REQUEST_TIMEOUT
@@ -118,6 +117,7 @@ def get_gigachat_token() -> str:
     response.raise_for_status()
     return response.json().get("access_token")
 
+# Инициализация моделей
 def initialize_models() -> Tuple[GigaChatEmbeddings, GigaChat]:
     access_token = get_gigachat_token()
     embedding_model = GigaChatEmbeddings(
@@ -134,6 +134,7 @@ def initialize_models() -> Tuple[GigaChatEmbeddings, GigaChat]:
     )
     return embedding_model, ai_assistant
 
+# Загрузка CSV данных
 def load_data() -> List[Document]:
     try:
         df = pd.read_csv(Config.CSV_DATA_URL, sep=';', on_bad_lines='skip')
@@ -170,6 +171,7 @@ def load_data() -> List[Document]:
         documents.append(doc)
     return documents
 
+# Веб-поиск через DuckDuckGo
 def perform_web_search(query: str) -> str:
     try:
         results = []
@@ -181,6 +183,24 @@ def perform_web_search(query: str) -> str:
         logger.error(f"Ошибка веб-поиска: {e}")
         return "Ошибка при выполнении поиска"
 
+# Fuzzy search по RAG
+def fuzzy_retrieval(question: str, docs: List[Document], limit: int = 5) -> List[Document]:
+    if not docs:
+        return []
+    corpus = [f"{doc.metadata.get('name','')} {doc.page_content}" for doc in docs]
+    matches = process.extract(
+        question,
+        corpus,
+        scorer=fuzz.WRatio,
+        limit=limit
+    )
+    results = []
+    for match_text, score, idx in matches:
+        if score > 50:
+            results.append(docs[idx])
+    return results
+
+# Prompt для AI
 TOURISM_PROMPT_TEMPLATE = """
 Ты виртуальный гид по Суздалю. Отвечай на вопросы информативно и дружелюбно.
 
@@ -198,7 +218,6 @@ TOURISM_PROMPT_TEMPLATE = """
 
 Ответь подробно и полезно, предлагая конкретные рекомендации.
 """
-
 tourism_prompt = PromptTemplate.from_template(TOURISM_PROMPT_TEMPLATE)
 
 def generate_ai_response(question: str, context_docs: List[Document], web_results: str, dialog_context: str) -> str:
@@ -211,6 +230,7 @@ def generate_ai_response(question: str, context_docs: List[Document], web_result
     response = ai_assistant.invoke(tourism_prompt.format(**prompt_input))
     return response.content if hasattr(response, 'content') else str(response)
 
+# Работа с базой
 def update_dialog_context(db: Session, user_id: str, role: str, message: str):
     session = db.query(ChatSession).filter(ChatSession.id == user_id).first()
     if not session:
@@ -235,10 +255,18 @@ def get_dialog_context(db: Session, user_id: str, max_messages: int = 10) -> str
     messages = db.query(Message).filter(Message.session_id == user_id).order_by(Message.timestamp.asc()).limit(max_messages).all()
     return "\n".join(f"{msg.role}: {msg.content}" for msg in messages)
 
-# 🔹 Проверка на необходимость уточнения
+# Проверка на непонятное сообщение
+def is_message_unclear(message: str) -> bool:
+    msg = message.strip()
+    if len(msg) < 3:
+        return True
+    if all(c in ".,!? " for c in msg):
+        return True
+    return False
+
+# Проверка на уточнения
 def needs_clarification(question: str) -> Tuple[bool, str]:
     q = question.lower()
-
     if "рестора" in q or "поесть" in q or "кухн" in q:
         return True, (
             "Вы ищете ресторан. Можете уточнить:\n"
@@ -246,7 +274,6 @@ def needs_clarification(question: str) -> Tuple[bool, str]:
             "- Важно ли расположение (центр, окраина, рядом с достопримечательностями)?\n"
             "- Нужен ли бюджетный вариант или премиум?"
         )
-
     if any(word in q for word in ["достопримечательности", "музеи", "куда сходить", "что посетить"]):
         return True, (
             "Вы ищете достопримечательности. Хотите больше про:\n"
@@ -255,10 +282,8 @@ def needs_clarification(question: str) -> Tuple[bool, str]:
             "- Храмы и монастыри\n"
             "- Природные места"
         )
-
     return False, ""
 
-# 🔹 Форматирование найденных данных
 def format_context_docs(docs: List[Document]) -> str:
     if not docs:
         return "В базе данных ничего не найдено."
@@ -281,11 +306,16 @@ def format_context_docs(docs: List[Document]) -> str:
         lines.append("\n".join(entry))
     return "\n\n".join(lines)
 
-# 🔹 Основная логика
+# Основная логика
 def handle_question(db: Session, question: str, user_id: str) -> str:
     question = question.strip()
     if not question:
         return "Пожалуйста, задайте ваш вопрос о Суздале."
+
+    if is_message_unclear(question):
+        response = "Не очень понял ваше сообщение, пожалуйста, напишите ещё раз."
+        update_dialog_context(db, user_id, "assistant", response)
+        return response
 
     update_dialog_context(db, user_id, "user", question)
     dialog_context = get_dialog_context(db, user_id)
@@ -299,29 +329,25 @@ def handle_question(db: Session, question: str, user_id: str) -> str:
             update_dialog_context(db, user_id, "assistant", response)
             return response
 
-    # 1. Проверка на необходимость уточнения
+    # Уточнения
     needs_clarify, clarification_text = needs_clarification(question)
     if needs_clarify:
         update_dialog_context(db, user_id, "assistant", clarification_text)
         return clarification_text
 
-    # 2. Поиск в базе (RAG)
-    context_docs = document_retriever.invoke(question)
+    # Поиск в базе (RAG) с fuzzy search
+    context_docs = fuzzy_retrieval(question, documents, limit=Config.RETRIEVER_K)
 
     if context_docs:
         formatted_context = format_context_docs(context_docs)
         ai_answer = generate_ai_response(question, context_docs, "", dialog_context)
-
-        set_last_question(db, user_id, question)  # ✅ сохранили вопрос
-
+        set_last_question(db, user_id, question)
         response = (
             f"📚 Вот что я нашёл в базе:\n\n{formatted_context}\n\n"
             f"🤖 {ai_answer}\n\n"
             "Хотите, я дополнительно поищу информацию в интернете?"
         )
-
     else:
-        # Если в базе ничего нет → сразу ищем в интернете
         web_results = perform_web_search(question)
         response = f"🌐 В базе ничего не найдено. Вот что удалось найти в интернете:\n\n{web_results}"
 
