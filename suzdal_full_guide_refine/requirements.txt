@@ -10,6 +10,7 @@ langchain-community
 langchain-gigachat
 faiss-cpu
 ddgs>=2.0.0
+rapidfuzz
 duckduckgo-search
 sqlalchemy
 psycopg2-binary
