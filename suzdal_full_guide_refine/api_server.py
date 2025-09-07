@@ -3,7 +3,7 @@ import requests
 import pandas as pd
 from pathlib import Path
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, Column, String, Text, DateTime, Integer, ForeignKey, Index
 from sqlalchemy.ext.declarative import declarative_base
@@ -20,6 +20,7 @@ from ddgs import DDGS
 import logging
 from typing import List, Tuple
 import uuid
+import uvicorn
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -223,23 +224,71 @@ def get_dialog_context(db: Session, user_id: str, max_messages: int = 10) -> str
     messages = db.query(Message).filter(Message.session_id == user_id).order_by(Message.timestamp.asc()).limit(max_messages).all()
     return "\n".join(f"{msg.role}: {msg.content}" for msg in messages)
 
+# 🔹 Проверка на необходимость уточнения
+def needs_clarification(question: str) -> Tuple[bool, str]:
+    q = question.lower()
+    if any(word in q for word in ["где поесть", "что посетить", "куда сходить", "достопримечательности", "музеи", "рестораны"]):
+        return True, (
+            "Можете уточнить, что для вас важнее?\n"
+            "- бюджет\n"
+            "- тип кухни или место\n"
+            "- расположение\n"
+            "- время работы\n\n"
+            "Это поможет мне подобрать лучший вариант."
+        )
+    return False, ""
+
+# 🔹 Форматирование найденных данных
+def format_context_docs(docs: List[Document]) -> str:
+    if not docs:
+        return "В базе данных ничего не найдено."
+    lines = []
+    for doc in docs:
+        meta = doc.metadata
+        entry = []
+        if "name" in meta:
+            entry.append(f"🏷 {meta['name']}")
+        if "type" in meta:
+            entry.append(f"Тип: {meta['type']}")
+        if "address" in meta:
+            entry.append(f"📍 Адрес: {meta['address']}")
+        if "hours" in meta:
+            entry.append(f"🕒 Время работы: {meta['hours']}")
+        if "price" in meta:
+            entry.append(f"💰 Цена: {meta['price']}")
+        if "description" in meta:
+            entry.append(f"ℹ {meta['description']}")
+        lines.append("\n".join(entry))
+    return "\n\n".join(lines)
+
+# 🔹 Основная логика
 def handle_question(db: Session, question: str, user_id: str) -> str:
     question = question.strip()
     if not question:
         return "Пожалуйста, задайте ваш вопрос о Суздале."
-    
+
     update_dialog_context(db, user_id, "user", question)
     dialog_context = get_dialog_context(db, user_id)
+
+    # 1. Проверка на необходимость уточнения
+    needs_clarify, clarification_text = needs_clarification(question)
+    if needs_clarify:
+        update_dialog_context(db, user_id, "assistant", clarification_text)
+        return clarification_text
+
+    # 2. Поиск в базе
     context_docs = document_retriever.invoke(question)
 
     if context_docs:
-        response = generate_ai_response(question, context_docs, "", dialog_context)
+        formatted_context = format_context_docs(context_docs)
+        ai_answer = generate_ai_response(question, context_docs, "", dialog_context)
+        response = f"📚 Вот что я нашёл в базе:\n\n{formatted_context}\n\n🤖 {ai_answer}"
         if len(context_docs) < 3:
             response += "\n\n🤔 В базе мало информации. Хотите, я попробую поискать ещё и в интернете?"
     else:
         if any(word in question.lower() for word in ["да", "ищи", "интернет"]):
             web_results = perform_web_search(question)
-            response = f"Вот что удалось найти в интернете:\n\n{web_results}"
+            response = f"🌐 Вот что удалось найти в интернете:\n\n{web_results}"
         else:
             response = "К сожалению, в базе нет информации. Хотите, я попробую поискать в интернете?"
 
@@ -265,7 +314,6 @@ class Question(BaseModel):
     question: str
     user_id: str = "default"
 
-# Новый root эндпоинт
 @app.get("/")
 async def root():
     return {"message": "Suzdal Tourism Assistant API работает. Используйте /ask для вопросов."}
@@ -282,6 +330,5 @@ async def health_check():
     return {"status": "healthy", "timestamp": datetime.utcnow()}
 
 if __name__ == "__main__":
-    import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8001)
 
