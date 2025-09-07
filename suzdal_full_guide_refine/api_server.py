@@ -18,9 +18,8 @@ from langchain_core.prompts import PromptTemplate
 from tenacity import retry, stop_after_attempt, wait_exponential
 from ddgs import DDGS
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import List, Tuple
 import uuid
-import re
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -58,7 +57,7 @@ class Message(Base):
     message_metadata = Column(JSON, nullable=True)
     session = relationship("ChatSession", back_populates="messages")
 
-# Создание индексов для улучшения производительности
+# Индексы
 Index('ix_messages_session_id', Message.session_id)
 Index('ix_messages_timestamp', Message.timestamp)
 Index('ix_messages_session_role', Message.session_id, Message.role)
@@ -66,7 +65,7 @@ Index('ix_messages_session_role', Message.session_id, Message.role)
 # Создание таблиц
 Base.metadata.create_all(bind=engine)
 
-# Dependency для получения сессии БД
+# Dependency для БД
 def get_db():
     db = SessionLocal()
     try:
@@ -77,38 +76,15 @@ def get_db():
 class Config:
     MAX_RETRIES = 3
     REQUEST_TIMEOUT = 15
-    MIN_QUESTION_LENGTH = 2
     SEARCH_RESULTS = 3
     RETRIEVER_K = 5
-    MAX_CONTEXT_LENGTH = 20
-    MAX_MESSAGES_TO_KEEP = 50
-
     CERT_PATH = os.getenv("CERT_PATH", "./cert.pem")
     CERT_URL = os.getenv("CERT_URL")
     GIGACHAT_AUTH = os.getenv("GIGACHAT_AUTH")
-    CSV_DATA_URL = os.getenv("CSV_DATA_URL", "https://raw.githubusercontent.com/vuyq/SuzdalAI/main/suzdal_full_guide_refine/attractions.csv")
-
-    FOOD_KEYWORDS = ["еда", "поесть", "кафе", "ресторан", "перекусить", "кухня", "столовая", "меню", "завтрак", "обед", "ужин"]
-    MUSEUM_KEYWORDS = ["музей", "музеи", "экспозиция", "выставка", "галерея", "коллекция"]
-    ATTRACTION_KEYWORDS = ["достопримечательность", "посмотреть", "посетить", "интересное", "место", "архитектура", "памятник"]
-    ACCOMMODATION_KEYWORDS = ["отель", "гостиница", "хостел", "номер", "жилье", "размещение", "ночлег"]
-    TRANSPORT_KEYWORDS = ["транспорт", "добраться", "автобус", "поезд", "такси", "маршрут"]
-
-    FOOD_CATEGORIES = ["ресторан", "кафе", "столовая", "паб", "бар", "трактир", "чайная", "кофейня"]
-    MUSEUM_CATEGORIES = ["музей", "экспозиция", "галерея", "выставка"]
-    ACCOMMODATION_CATEGORIES = ["отель", "гостиница", "хостел", "гостевой дом", "апартаменты", "номер"]
-    ATTRACTION_CATEGORIES = ["смотровая площадка", "парк", "монастырь", "церковь", "собор", "кремль", "памятник"]
-
-    CLARIFICATION_PHRASES = [
-        "что для вас важнее",
-        "уточните пожалуйста",
-        "по каким критериям",
-        "что предпочитаете",
-        "какой вариант выбрать",
-        "какая кухня",
-        "какой бюджет",
-        "где расположение"
-    ]
+    CSV_DATA_URL = os.getenv(
+        "CSV_DATA_URL",
+        "https://raw.githubusercontent.com/vuyq/SuzdalAI/main/suzdal_full_guide_refine/attractions.csv"
+    )
 
 def download_certificate():
     if Config.CERT_URL and not Path(Config.CERT_PATH).exists():
@@ -173,13 +149,13 @@ def load_data() -> List[Document]:
                 metadata['name'] = str(val)
             elif col_lower in ['type', 'тип', 'category', 'категория']:
                 metadata['type'] = str(val)
-            elif col_lower in ['address', 'адрес', 'location', 'локация']:
+            elif col_lower in ['address', 'адрес']:
                 metadata['address'] = str(val)
-            elif col_lower in ['price', 'цена', 'стоимость']:
+            elif col_lower in ['price', 'цена']:
                 metadata['price'] = str(val)
-            elif col_lower in ['hours', 'время', 'работа', 'часы']:
+            elif col_lower in ['hours', 'часы']:
                 metadata['hours'] = str(val)
-            elif col_lower in ['description', 'описание', 'info', 'информация']:
+            elif col_lower in ['description', 'описание']:
                 metadata['description'] = str(val)
             else:
                 content.append(f"{col}: {val}")
@@ -281,12 +257,18 @@ except Exception as e:
     logger.critical(f"Ошибка инициализации: {e}")
     documents = []
 
+# FastAPI
 app = FastAPI(title="Суздаль Tourism Assistant")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 class Question(BaseModel):
     question: str
     user_id: str = "default"
+
+# Новый root эндпоинт
+@app.get("/")
+async def root():
+    return {"message": "Suzdal Tourism Assistant API работает. Используйте /ask для вопросов."}
 
 @app.post("/ask")
 async def ask(item: Question, db: Session = Depends(get_db)):
@@ -302,3 +284,4 @@ async def health_check():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8001)
+
