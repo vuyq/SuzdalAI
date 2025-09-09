@@ -3,7 +3,7 @@ import requests
 import pandas as pd
 from pathlib import Path
 from dotenv import load_dotenv
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, Column, String, Text, DateTime, Integer, ForeignKey, Index
 from sqlalchemy.ext.declarative import declarative_base
@@ -16,10 +16,13 @@ from langchain_gigachat import GigaChat, GigaChatEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.prompts import PromptTemplate
 from tenacity import retry, stop_after_attempt, wait_exponential
-from ddgs import DDGS
+try:
+    from ddgs import DDGS
+except ImportError:
+    DDGS = None
 from rapidfuzz import process, fuzz
 import logging
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 import uuid
 import uvicorn
 
@@ -86,6 +89,13 @@ class Config:
         "https://raw.githubusercontent.com/vuyq/SuzdalAI/main/suzdal_full_guide_refine/attractions.csv"
     )
 
+# Глобальные переменные для моделей
+embedding_model = None
+ai_assistant = None
+documents = []
+vector_store = None
+document_retriever = None
+
 # Загрузка сертификата
 def download_certificate():
     if Config.CERT_URL and not Path(Config.CERT_PATH).exists():
@@ -119,27 +129,35 @@ def get_gigachat_token() -> str:
 
 # Инициализация моделей
 def initialize_models() -> Tuple[GigaChatEmbeddings, GigaChat]:
-    access_token = get_gigachat_token()
-    embedding_model = GigaChatEmbeddings(
-        access_token=access_token, model="Embeddings", scope="GIGACHAT_API_PERS",
-        verify_ssl_certs=bool(Config.CERT_PATH),
-        ca_bundle_file=Config.CERT_PATH if Path(Config.CERT_PATH).exists() else None,
-        timeout=Config.REQUEST_TIMEOUT
-    )
-    ai_assistant = GigaChat(
-        access_token=access_token, model="GigaChat", temperature=0.2,
-        verify_ssl_certs=bool(Config.CERT_PATH),
-        ca_bundle_file=Config.CERT_PATH if Path(Config.CERT_PATH).exists() else None,
-        timeout=Config.REQUEST_TIMEOUT, verbose=True
-    )
-    return embedding_model, ai_assistant
+    try:
+        access_token = get_gigachat_token()
+        embedding_model = GigaChatEmbeddings(
+            access_token=access_token, model="Embeddings", scope="GIGACHAT_API_PERS",
+            verify_ssl_certs=bool(Config.CERT_PATH),
+            ca_bundle_file=Config.CERT_PATH if Path(Config.CERT_PATH).exists() else None,
+            timeout=Config.REQUEST_TIMEOUT
+        )
+        ai_assistant = GigaChat(
+            access_token=access_token, model="GigaChat", temperature=0.2,
+            verify_ssl_certs=bool(Config.CERT_PATH),
+            ca_bundle_file=Config.CERT_PATH if Path(Config.CERT_PATH).exists() else None,
+            timeout=Config.REQUEST_TIMEOUT, verbose=True
+        )
+        return embedding_model, ai_assistant
+    except Exception as e:
+        logger.error(f"Ошибка инициализации моделей: {e}")
+        raise
 
 # Загрузка CSV данных
 def load_data() -> List[Document]:
     try:
         df = pd.read_csv(Config.CSV_DATA_URL, sep=';', on_bad_lines='skip')
     except Exception:
-        df = pd.read_csv(Config.CSV_DATA_URL, on_bad_lines='skip')
+        try:
+            df = pd.read_csv(Config.CSV_DATA_URL, on_bad_lines='skip')
+        except Exception as e:
+            logger.error(f"Ошибка загрузки CSV: {e}")
+            return []
 
     documents = []
     for _, row in df.iterrows():
@@ -174,6 +192,9 @@ def load_data() -> List[Document]:
 # Веб-поиск через DuckDuckGo
 def perform_web_search(query: str) -> str:
     try:
+        if DDGS is None:
+            return "Веб-поиск недоступен (модуль ddgs не установлен)"
+            
         results = []
         with DDGS() as ddgs:
             for r in ddgs.text(f"{query} Суздаль", max_results=Config.SEARCH_RESULTS, timelimit='y'):
@@ -202,58 +223,99 @@ def fuzzy_retrieval(question: str, docs: List[Document], limit: int = 5) -> List
 
 # Prompt для AI
 TOURISM_PROMPT_TEMPLATE = """
-Ты виртуальный гид по Суздалю. Отвечай на вопросы информативно и дружелюбно.
+Ты виртуальный гид по Суздалю. Отвечай на вопросы информативно и дружелюбно, учитывая контекст предыдущего диалога.
 
-[Контекст диалога]:
+[История диалога]:
 {dialog_context}
 
-[Данные из базы]:
+[Данные из базы о достопримечательностях]:
 {context}
 
 [Веб-результаты]:
 {web_search}
 
-[Вопрос]:
+[Текущий вопрос]:
 {question}
 
-Ответь подробно и полезно, предлагая конкретные рекомендации.
+Учти всю историю диалога выше. Отвечай подробно и полезно, предлагая конкретные рекомендации. Если в истории уже обсуждались какие-то места, упомяни это в ответе.
 """
 tourism_prompt = PromptTemplate.from_template(TOURISM_PROMPT_TEMPLATE)
 
 def generate_ai_response(question: str, context_docs: List[Document], web_results: str, dialog_context: str) -> str:
-    prompt_input = {
-        "question": question,
-        "context": "\n\n".join(d.page_content for d in context_docs) if context_docs else "Нет данных в базе",
-        "web_search": web_results,
-        "dialog_context": dialog_context
-    }
-    response = ai_assistant.invoke(tourism_prompt.format(**prompt_input))
-    return response.content if hasattr(response, 'content') else str(response)
+    try:
+        prompt_input = {
+            "question": question,
+            "context": "\n\n".join(d.page_content for d in context_docs) if context_docs else "Нет данных в базе",
+            "web_search": web_results,
+            "dialog_context": dialog_context
+        }
+        response = ai_assistant.invoke(tourism_prompt.format(**prompt_input))
+        return response.content if hasattr(response, 'content') else str(response)
+    except Exception as e:
+        logger.error(f"Ошибка генерации ответа: {e}")
+        return "Извините, произошла ошибка при генерации ответа."
 
 # Работа с базой
 def update_dialog_context(db: Session, user_id: str, role: str, message: str):
-    session = db.query(ChatSession).filter(ChatSession.id == user_id).first()
-    if not session:
-        session = ChatSession(id=user_id)
-        db.add(session)
+    try:
+        session = db.query(ChatSession).filter(ChatSession.id == user_id).first()
+        if not session:
+            session = ChatSession(id=user_id)
+            db.add(session)
+            db.commit()
+        db_message = Message(session_id=user_id, role=role, content=message, timestamp=datetime.utcnow())
+        db.add(db_message)
         db.commit()
-    db_message = Message(session_id=user_id, role=role, content=message, timestamp=datetime.utcnow())
-    db.add(db_message)
-    db.commit()
+    except Exception as e:
+        logger.error(f"Ошибка обновления контекста диалога: {e}")
+        db.rollback()
 
 def set_last_question(db: Session, user_id: str, question: str):
-    session = db.query(ChatSession).filter(ChatSession.id == user_id).first()
-    if session:
-        session.last_question = question
+    try:
+        session = db.query(ChatSession).filter(ChatSession.id == user_id).first()
+        if session:
+            session.last_question = question
+            db.commit()
+    except Exception as e:
+        logger.error(f"Ошибка установки последнего вопроса: {e}")
+        db.rollback()
+
+def get_last_question(db: Session, user_id: str) -> Optional[str]:
+    try:
+        session = db.query(ChatSession).filter(ChatSession.id == user_id).first()
+        return session.last_question if session else None
+    except Exception as e:
+        logger.error(f"Ошибка получения последнего вопроса: {e}")
+        return None
+
+def get_dialog_context(db: Session, user_id: str, max_messages: int = 20) -> str:
+    try:
+        # Получаем сообщения в правильном порядке (от старых к новым)
+        messages = db.query(Message).filter(Message.session_id == user_id)\
+                     .order_by(Message.timestamp.asc()).limit(max_messages).all()
+        
+        dialog_lines = []
+        for msg in messages:
+            role = "Пользователь" if msg.role == "user" else "Ассистент"
+            dialog_lines.append(f"{role}: {msg.content}")
+        
+        return "\n".join(dialog_lines)
+    except Exception as e:
+        logger.error(f"Ошибка получения контекста диалога: {e}")
+        return ""
+
+def clear_chat_history(db: Session, user_id: str):
+    """Очищает историю сообщений для пользователя"""
+    try:
+        db.query(Message).filter(Message.session_id == user_id).delete()
+        session = db.query(ChatSession).filter(ChatSession.id == user_id).first()
+        if session:
+            session.last_question = None
         db.commit()
-
-def get_last_question(db: Session, user_id: str) -> str:
-    session = db.query(ChatSession).filter(ChatSession.id == user_id).first()
-    return session.last_question if session else None
-
-def get_dialog_context(db: Session, user_id: str, max_messages: int = 10) -> str:
-    messages = db.query(Message).filter(Message.session_id == user_id).order_by(Message.timestamp.asc()).limit(max_messages).all()
-    return "\n".join(f"{msg.role}: {msg.content}" for msg in messages)
+        logger.info(f"История чата очищена для пользователя {user_id}")
+    except Exception as e:
+        logger.error(f"Ошибка очистки истории: {e}")
+        db.rollback()
 
 # Проверка на непонятное сообщение
 def is_message_unclear(message: str) -> bool:
@@ -328,6 +390,10 @@ def handle_question(db: Session, question: str, user_id: str) -> str:
             response = f"🌐 Вот что удалось найти в интернете по вашему запросу «{last_q}»:\n\n{web_results}"
             update_dialog_context(db, user_id, "assistant", response)
             return response
+        else:
+            response = "Не могу найти предыдущий запрос для поиска в интернете."
+            update_dialog_context(db, user_id, "assistant", response)
+            return response
 
     # Уточнения
     needs_clarify, clarification_text = needs_clarification(question)
@@ -345,7 +411,7 @@ def handle_question(db: Session, question: str, user_id: str) -> str:
         response = (
             f"📚 Вот что я нашёл в базе:\n\n{formatted_context}\n\n"
             f"🤖 {ai_answer}\n\n"
-            "Хотите, я дополнительно поищу информацию в интернете?"
+            "Хотите, я дополнительно поищу информацию в интернете? Просто напишите 'да' или 'ищи'."
         )
     else:
         web_results = perform_web_search(question)
@@ -355,15 +421,24 @@ def handle_question(db: Session, question: str, user_id: str) -> str:
     return response
 
 # Инициализация
-try:
-    download_certificate()
-    embedding_model, ai_assistant = initialize_models()
-    documents = load_data()
-    vector_store = FAISS.from_documents(documents, embedding_model)
-    document_retriever = vector_store.as_retriever(search_kwargs={"k": Config.RETRIEVER_K})
-except Exception as e:
-    logger.critical(f"Ошибка инициализации: {e}")
-    documents = []
+def initialize_app():
+    global embedding_model, ai_assistant, documents, vector_store, document_retriever
+    try:
+        download_certificate()
+        embedding_model, ai_assistant = initialize_models()
+        documents = load_data()
+        if documents:
+            vector_store = FAISS.from_documents(documents, embedding_model)
+            document_retriever = vector_store.as_retriever(search_kwargs={"k": Config.RETRIEVER_K})
+            logger.info(f"Приложение успешно инициализировано, загружено {len(documents)} документов")
+        else:
+            logger.warning("Документы не загружены, RAG будет работать в ограниченном режиме")
+    except Exception as e:
+        logger.critical(f"Ошибка инициализации: {e}")
+        documents = []
+
+# Инициализируем приложение
+initialize_app()
 
 # FastAPI
 app = FastAPI(title="Суздаль Tourism Assistant")
@@ -381,12 +456,53 @@ async def root():
 async def ask(item: Question, db: Session = Depends(get_db)):
     if not item.question.strip():
         return {"answer": "Пожалуйста, задайте ваш вопрос."}
-    response = handle_question(db, item.question, item.user_id)
-    return {"answer": response}
+    try:
+        response = handle_question(db, item.question, item.user_id)
+        return {"answer": response}
+    except Exception as e:
+        logger.error(f"Ошибка обработки вопроса: {e}")
+        raise HTTPException(status_code=500, detail="Ошибка обработки вопроса")
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "timestamp": datetime.utcnow()}
+    status = "healthy" if documents else "degraded (no documents loaded)"
+    return {
+        "status": status, 
+        "timestamp": datetime.utcnow(),
+        "documents_loaded": len(documents)
+    }
+
+@app.get("/history/{user_id}")
+async def get_history(user_id: str, db: Session = Depends(get_db)):
+    """Получить историю сообщений пользователя"""
+    try:
+        messages = db.query(Message).filter(Message.session_id == user_id)\
+                     .order_by(Message.timestamp.asc()).all()
+        
+        history = []
+        for msg in messages:
+            history.append({
+                "role": msg.role,
+                "content": msg.content,
+                "timestamp": msg.timestamp.isoformat()
+            })
+        
+        return {"user_id": user_id, "history": history}
+    except Exception as e:
+        logger.error(f"Ошибка получения истории: {e}")
+        raise HTTPException(status_code=500, detail="Ошибка получения истории")
+
+@app.post("/clear_history/{user_id}")
+async def clear_history(user_id: str, db: Session = Depends(get_db)):
+    """Очищает историю сообщений для указанного пользователя"""
+    try:
+        clear_chat_history(db, user_id)
+        return {"status": "history cleared", "user_id": user_id}
+    except Exception as e:
+        logger.error(f"Ошибка очистки истории: {e}")
+        raise HTTPException(status_code=500, detail="Ошибка очистки истории")
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    # Используем порт из переменной окружения или 8000 по умолчанию
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
