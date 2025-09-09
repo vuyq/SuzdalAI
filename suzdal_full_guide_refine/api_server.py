@@ -9,22 +9,22 @@ from sqlalchemy import create_engine, Column, String, Text, DateTime, Integer, F
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship
 from sqlalchemy.dialects.postgresql import JSON
-from datetime import datetime
+from datetime import datetime, timedelta
 from pydantic import BaseModel
 from langchain_core.documents import Document
 from langchain_gigachat import GigaChat, GigaChatEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.prompts import PromptTemplate
 from tenacity import retry, stop_after_attempt, wait_exponential
-try:
-    from ddgs import DDGS
-except ImportError:
-    DDGS = None
+from ddgs import DDGS
 from rapidfuzz import process, fuzz
 import logging
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict, Any
 import uuid
 import uvicorn
+import json
+from functools import lru_cache
+import time
 
 # Логирование
 logging.basicConfig(level=logging.INFO)
@@ -88,6 +88,7 @@ class Config:
         "CSV_DATA_URL",
         "https://raw.githubusercontent.com/vuyq/SuzdalAI/main/suzdal_full_guide_refine/attractions.csv"
     )
+    TOKEN_EXPIRY_MINUTES = 25  # Токен живет ~30 минут, обновляем заранее
 
 # Глобальные переменные для моделей
 embedding_model = None
@@ -95,6 +96,44 @@ ai_assistant = None
 documents = []
 vector_store = None
 document_retriever = None
+app_initialized = False
+token_manager = None
+
+# Менеджер для управления токенами GigaChat
+class GigaChatTokenManager:
+    def __init__(self):
+        self.access_token = None
+        self.token_expires = None
+        self.lock = False
+        
+    def get_valid_token(self) -> str:
+        """Получает валидный токен, обновляя при необходимости"""
+        if self.access_token and self.token_expires and datetime.now() < self.token_expires:
+            return self.access_token
+        
+        # Защита от параллельных запросов
+        if self.lock:
+            # Ждем, пока другой поток обновит токен
+            for _ in range(10):
+                time.sleep(0.1)
+                if self.access_token and datetime.now() < self.token_expires:
+                    return self.access_token
+        
+        self.lock = True
+        try:
+            self.access_token = get_gigachat_token()
+            self.token_expires = datetime.now() + timedelta(minutes=Config.TOKEN_EXPIRY_MINUTES)
+            logger.info("Токен GigaChat успешно обновлен")
+            return self.access_token
+        except Exception as e:
+            logger.error(f"Ошибка получения токена: {e}")
+            raise
+        finally:
+            self.lock = False
+    
+    def is_token_valid(self) -> bool:
+        """Проверяет, валиден ли текущий токен"""
+        return bool(self.access_token and self.token_expires and datetime.now() < self.token_expires)
 
 # Загрузка сертификата
 def download_certificate():
@@ -127,10 +166,10 @@ def get_gigachat_token() -> str:
     response.raise_for_status()
     return response.json().get("access_token")
 
-# Инициализация моделей
+# Инициализация моделей с обновляемым токеном
 def initialize_models() -> Tuple[GigaChatEmbeddings, GigaChat]:
     try:
-        access_token = get_gigachat_token()
+        access_token = token_manager.get_valid_token()
         embedding_model = GigaChatEmbeddings(
             access_token=access_token, model="Embeddings", scope="GIGACHAT_API_PERS",
             verify_ssl_certs=bool(Config.CERT_PATH),
@@ -146,6 +185,33 @@ def initialize_models() -> Tuple[GigaChatEmbeddings, GigaChat]:
         return embedding_model, ai_assistant
     except Exception as e:
         logger.error(f"Ошибка инициализации моделей: {e}")
+        raise
+
+# Обновление моделей с новым токеном
+def refresh_models():
+    """Обновляет модели с новым токеном"""
+    global embedding_model, ai_assistant
+    try:
+        access_token = token_manager.get_valid_token()
+        
+        # Обновляем embedding модель
+        if embedding_model:
+            embedding_model.access_token = access_token
+        
+        # Обновляем AI ассистента
+        if ai_assistant:
+            ai_assistant.access_token = access_token
+        else:
+            ai_assistant = GigaChat(
+                access_token=access_token, model="GigaChat", temperature=0.2,
+                verify_ssl_certs=bool(Config.CERT_PATH),
+                ca_bundle_file=Config.CERT_PATH if Path(Config.CERT_PATH).exists() else None,
+                timeout=Config.REQUEST_TIMEOUT, verbose=True
+            )
+            
+        logger.info("Модели успешно обновлены с новым токеном")
+    except Exception as e:
+        logger.error(f"Ошибка обновления моделей: {e}")
         raise
 
 # Загрузка CSV данных
@@ -189,7 +255,8 @@ def load_data() -> List[Document]:
         documents.append(doc)
     return documents
 
-# Веб-поиск через DuckDuckGo
+# Веб-поиск через DuckDuckGo с кэшированием
+@lru_cache(maxsize=100)
 def perform_web_search(query: str) -> str:
     try:
         if DDGS is None:
@@ -204,11 +271,27 @@ def perform_web_search(query: str) -> str:
         logger.error(f"Ошибка веб-поиска: {e}")
         return "Ошибка при выполнении поиска"
 
-# Fuzzy search по RAG
+# Поиск в векторной базе
+def search_in_vector_store(query: str, k: int = None) -> List[Document]:
+    """Поиск в векторной базе с использованием FAISS"""
+    if not vector_store or not document_retriever:
+        return []
+    
+    try:
+        k = k or Config.RETRIEVER_K
+        results = vector_store.similarity_search(query, k=k)
+        return results
+    except Exception as e:
+        logger.error(f"Ошибка поиска в векторной базе: {e}")
+        return []
+
+# Fuzzy search по RAG (резервный метод)
 def fuzzy_retrieval(question: str, docs: List[Document], limit: int = 5) -> List[Document]:
     if not docs:
         return []
-    corpus = [f"{doc.metadata.get('name','')} {doc.page_content}" for doc in docs]
+    
+    # Используем только названия для fuzzy search для производительности
+    corpus = [doc.metadata.get('name', '') for doc in docs]
     matches = process.extract(
         question,
         corpus,
@@ -243,6 +326,10 @@ tourism_prompt = PromptTemplate.from_template(TOURISM_PROMPT_TEMPLATE)
 
 def generate_ai_response(question: str, context_docs: List[Document], web_results: str, dialog_context: str) -> str:
     try:
+        # Проверяем и обновляем токен при необходимости
+        if not token_manager.is_token_valid():
+            refresh_models()
+        
         prompt_input = {
             "question": question,
             "context": "\n\n".join(d.page_content for d in context_docs) if context_docs else "Нет данных в базе",
@@ -253,7 +340,14 @@ def generate_ai_response(question: str, context_docs: List[Document], web_result
         return response.content if hasattr(response, 'content') else str(response)
     except Exception as e:
         logger.error(f"Ошибка генерации ответа: {e}")
-        return "Извините, произошла ошибка при генерации ответа."
+        # Пытаемся обновить токен и повторить
+        try:
+            refresh_models()
+            response = ai_assistant.invoke(tourism_prompt.format(**prompt_input))
+            return response.content if hasattr(response, 'content') else str(response)
+        except Exception as retry_error:
+            logger.error(f"Повторная ошибка генерации ответа: {retry_error}")
+            return "Извините, произошла ошибка при генерации ответа. Попробуйте позже."
 
 # Работа с базой
 def update_dialog_context(db: Session, user_id: str, role: str, message: str):
@@ -262,19 +356,21 @@ def update_dialog_context(db: Session, user_id: str, role: str, message: str):
         if not session:
             session = ChatSession(id=user_id)
             db.add(session)
-            db.commit()
+            # Не коммитим здесь, коммитим в конце
         db_message = Message(session_id=user_id, role=role, content=message, timestamp=datetime.utcnow())
         db.add(db_message)
-        db.commit()
+        db.commit()  # Один коммит для всего
     except Exception as e:
         logger.error(f"Ошибка обновления контекста диалога: {e}")
         db.rollback()
+        raise
 
 def set_last_question(db: Session, user_id: str, question: str):
     try:
         session = db.query(ChatSession).filter(ChatSession.id == user_id).first()
         if session:
             session.last_question = question
+            session.updated_at = datetime.utcnow()
             db.commit()
     except Exception as e:
         logger.error(f"Ошибка установки последнего вопроса: {e}")
@@ -290,7 +386,6 @@ def get_last_question(db: Session, user_id: str) -> Optional[str]:
 
 def get_dialog_context(db: Session, user_id: str, max_messages: int = 20) -> str:
     try:
-        # Получаем сообщения в правильном порядке (от старых к новым)
         messages = db.query(Message).filter(Message.session_id == user_id)\
                      .order_by(Message.timestamp.asc()).limit(max_messages).all()
         
@@ -311,11 +406,13 @@ def clear_chat_history(db: Session, user_id: str):
         session = db.query(ChatSession).filter(ChatSession.id == user_id).first()
         if session:
             session.last_question = None
+            session.updated_at = datetime.utcnow()
         db.commit()
         logger.info(f"История чата очищена для пользователя {user_id}")
     except Exception as e:
         logger.error(f"Ошибка очистки истории: {e}")
         db.rollback()
+        raise
 
 # Проверка на непонятное сообщение
 def is_message_unclear(message: str) -> bool:
@@ -370,6 +467,9 @@ def format_context_docs(docs: List[Document]) -> str:
 
 # Основная логика
 def handle_question(db: Session, question: str, user_id: str) -> str:
+    if not app_initialized:
+        return "Приложение еще не инициализировано. Попробуйте позже."
+    
     question = question.strip()
     if not question:
         return "Пожалуйста, задайте ваш вопрос о Суздале."
@@ -401,8 +501,12 @@ def handle_question(db: Session, question: str, user_id: str) -> str:
         update_dialog_context(db, user_id, "assistant", clarification_text)
         return clarification_text
 
-    # Поиск в базе (RAG) с fuzzy search
-    context_docs = fuzzy_retrieval(question, documents, limit=Config.RETRIEVER_K)
+    # Поиск в векторной базе (основной метод)
+    context_docs = search_in_vector_store(question)
+    
+    # Если в векторной базе ничего не найдено, используем fuzzy search как запасной вариант
+    if not context_docs and documents:
+        context_docs = fuzzy_retrieval(question, documents, limit=Config.RETRIEVER_K)
 
     if context_docs:
         formatted_context = format_context_docs(context_docs)
@@ -422,20 +526,35 @@ def handle_question(db: Session, question: str, user_id: str) -> str:
 
 # Инициализация
 def initialize_app():
-    global embedding_model, ai_assistant, documents, vector_store, document_retriever
+    global embedding_model, ai_assistant, documents, vector_store, document_retriever, app_initialized, token_manager
+    
     try:
         download_certificate()
+        
+        # Инициализируем менеджер токенов
+        token_manager = GigaChatTokenManager()
+        
+        # Инициализируем модели
         embedding_model, ai_assistant = initialize_models()
+        
+        # Загружаем документы
         documents = load_data()
+        
         if documents:
+            # Создаем векторное хранилище
             vector_store = FAISS.from_documents(documents, embedding_model)
             document_retriever = vector_store.as_retriever(search_kwargs={"k": Config.RETRIEVER_K})
             logger.info(f"Приложение успешно инициализировано, загружено {len(documents)} документов")
         else:
             logger.warning("Документы не загружены, RAG будет работать в ограниченном режиме")
+        
+        app_initialized = True
+        
     except Exception as e:
         logger.critical(f"Ошибка инициализации: {e}")
         documents = []
+        app_initialized = False
+        raise
 
 # Инициализируем приложение
 initialize_app()
@@ -454,8 +573,12 @@ async def root():
 
 @app.post("/ask")
 async def ask(item: Question, db: Session = Depends(get_db)):
+    if not app_initialized:
+        raise HTTPException(status_code=503, detail="Сервис временно недоступен. Идет инициализация.")
+    
     if not item.question.strip():
         return {"answer": "Пожалуйста, задайте ваш вопрос."}
+    
     try:
         response = handle_question(db, item.question, item.user_id)
         return {"answer": response}
@@ -465,11 +588,13 @@ async def ask(item: Question, db: Session = Depends(get_db)):
 
 @app.get("/health")
 async def health_check():
-    status = "healthy" if documents else "degraded (no documents loaded)"
+    status = "healthy" if app_initialized and documents else "degraded"
     return {
         "status": status, 
+        "initialized": app_initialized,
         "timestamp": datetime.utcnow(),
-        "documents_loaded": len(documents)
+        "documents_loaded": len(documents),
+        "token_valid": token_manager.is_token_valid() if token_manager else False
     }
 
 @app.get("/history/{user_id}")
@@ -502,7 +627,16 @@ async def clear_history(user_id: str, db: Session = Depends(get_db)):
         logger.error(f"Ошибка очистки истории: {e}")
         raise HTTPException(status_code=500, detail="Ошибка очистки истории")
 
+@app.post("/reinitialize")
+async def reinitialize():
+    """Переинициализирует приложение (для административных целей)"""
+    try:
+        initialize_app()
+        return {"status": "reinitialized", "success": app_initialized}
+    except Exception as e:
+        logger.error(f"Ошибка переинициализации: {e}")
+        raise HTTPException(status_code=500, detail="Ошибка переинициализации")
+
 if __name__ == "__main__":
-    # Используем порт из переменной окружения или 8000 по умолчанию
     port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
