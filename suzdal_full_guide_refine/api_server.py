@@ -428,12 +428,22 @@ def needs_clarification(question: str) -> Tuple[bool, str]:
     q = question.lower()
     if "рестора" in q or "поесть" in q or "кухн" in q:
         return True, (
-            "Вы ищете ресторан. Можете уточнить:\n"
-            "- Какой тип кухни предпочитаете (русская, японская, китайская, европейская)?\n"
+            "Я вижу, что Вы ищите ресторан или кофе. Можете уточнить:\n"
+            "- Какой тип кухни предпочитаете (русская, японская, китайская, европейская, любая)?\n"
             "- Важно ли расположение (центр, окраина, рядом с достопримечательностями)?\n"
             "- Нужен ли бюджетный вариант или премиум?"
         )
     if any(word in q for word in ["достопримечательности", "музеи", "куда сходить", "что посетить"]):
+    if "узе" in q:  # Отлавливаем "музей", "музеи", "музеев" и т.д.
+        return True, (
+            "В Суздале много интересных музеев. Какой вас интересует больше?\n\n"
+            "• Музей деревянного зодчества\n"
+            "• Спасо-Евфимиев монастырь (музейный комплекс)\n"
+            "• Кремль с его экспозициями\n"
+            "• Музей восковых фигур\n"
+            "• Или что-то другое?"
+        )
+    else:
         return True, (
             "Вы ищете достопримечательности. Хотите больше про:\n"
             "- Исторические объекты\n"
@@ -453,7 +463,7 @@ def format_context_docs(docs: List[Document]) -> str:
         if "name" in meta:
             entry.append(f"🏷 {meta['name']}")
         if "type" in meta:
-            entry.append(f"Тип: {meta['type']}")
+            entry.append(f"{meta['type']}")
         if "address" in meta:
             entry.append(f"📍 Адрес: {meta['address']}")
         if "hours" in meta:
@@ -472,26 +482,36 @@ def handle_question(db: Session, question: str, user_id: str) -> str:
     
     question = question.strip()
     if not question:
-        return "Пожалуйста, задайте ваш вопрос о Суздале."
+        return "Пожалуйста, задайте Ваш вопрос. Я всегда готов помочь!"
 
     if is_message_unclear(question):
-        response = "Не очень понял ваше сообщение, пожалуйста, напишите ещё раз."
+        response = "Не очень понял Ваше сообщение, пожалуйста, напишите ещё раз."
         update_dialog_context(db, user_id, "assistant", response)
         return response
 
     update_dialog_context(db, user_id, "user", question)
     dialog_context = get_dialog_context(db, user_id)
 
-    # Проверка: пользователь сказал "да, ищи в интернете"
+    if question.lower() in ["да", "расскажи", "расскажи подробнее", "подробнее"]:
+        context_docs = search_in_vector_store(last_q)
+        if context_docs:
+            ai_answer = generate_ai_response(last_q, context_docs, "", get_dialog_context(db, user_id))
+            response = f"🤖 Расширенный рассказ:\n\n{ai_answer}"
+        else:
+            response = "К сожалению, не могу найти информацию для подробного рассказа."
+    
+        update_dialog_context(db, user_id, "assistant", response)
+        return response
+
     if question.lower() in ["да", "ищи", "да, ищи", "в интернете", "давай интернет"]:
         last_q = get_last_question(db, user_id)
         if last_q:
             web_results = perform_web_search(last_q)
-            response = f"🌐 Вот что удалось найти в интернете по вашему запросу «{last_q}»:\n\n{web_results}"
+            response = f"🌐 Вот что удалось найти в интернете по Вашему запросу! «{last_q}»:\n\n{web_results}"
             update_dialog_context(db, user_id, "assistant", response)
             return response
         else:
-            response = "Не могу найти предыдущий запрос для поиска в интернете."
+            response = "Простите, не могу найти предыдущий запрос для поиска в интернете."
             update_dialog_context(db, user_id, "assistant", response)
             return response
 
@@ -510,19 +530,19 @@ def handle_question(db: Session, question: str, user_id: str) -> str:
 
     if context_docs:
         formatted_context = format_context_docs(context_docs)
-        ai_answer = generate_ai_response(question, context_docs, "", dialog_context)
         set_last_question(db, user_id, question)
         response = (
-            f"📚 Вот что я нашёл в базе:\n\n{formatted_context}\n\n"
-            f"🤖 {ai_answer}\n\n"
-            "Хотите, я дополнительно поищу информацию в интернете? Просто напишите 'да' или 'ищи'."
+            f"Вот, что я могу вам предложить:\n\n{formatted_context}\n\n"
+            "Хотите, чтобы я сделал расширенный рассказ об этих местах на основе этой информации? "
+            "Просто напишите 'да' или 'расскажи подробнее'."
         )
     else:
         web_results = perform_web_search(question)
-        response = f"🌐 В базе ничего не найдено. Вот что удалось найти в интернете:\n\n{web_results}"
+        response = f"🌐 В базе ничего не найдено. Вот что мне удалось найти в интернете:\n\n{web_results}"
 
-    update_dialog_context(db, user_id, "assistant", response)
-    return response
+# Сохраняем context_docs в сессии для возможного последующего использования
+# (это потребует изменения модели базы данных или временного хранилища)
+    
 
 # Инициализация
 def initialize_app():
