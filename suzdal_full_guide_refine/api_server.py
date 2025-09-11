@@ -12,13 +12,8 @@ from sqlalchemy import inspect
 from datetime import datetime, timedelta
 from pydantic import BaseModel
 from langchain_core.documents import Document
-from langchain_gigachat import GigaChat, GigaChatEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.prompts import PromptTemplate
-from langchain_core.messages import HumanMessage, SystemMessage
-from tenacity import retry, stop_after_attempt, wait_exponential
-from ddgs import DDGS
-from rapidfuzz import process, fuzz
 import logging
 from typing import List, Tuple, Optional, Dict, Any
 import uuid
@@ -76,156 +71,22 @@ def get_db():
         db.close()
 
 class Config:
-    MAX_RETRIES = 3
-    REQUEST_TIMEOUT = 15
+    MAX_RETRIES = 2
+    REQUEST_TIMEOUT = 10
     SEARCH_RESULTS = 3
     RETRIEVER_K = 5
-    CERT_PATH = os.getenv("CERT_PATH", "./cert.pem")
-    CERT_URL = os.getenv("CERT_URL")
-    GIGACHAT_AUTH = os.getenv("GIGACHAT_AUTH")
     CSV_DATA_URL = os.getenv(
         "CSV_DATA_URL",
         "https://raw.githubusercontent.com/vuyq/SuzdalAI/main/suzdal_full_guide_refine/attractions.csv"
     )
-    TOKEN_EXPIRY_MINUTES = 25
     MEMORY_CONTEXT_SIZE = 10
     PREFERENCES_UPDATE_INTERVAL = 5
     SEMANTIC_SEARCH_K = 3
 
 # Глобальные переменные
-embedding_model = None
-ai_assistant = None
 documents = []
 vector_store = None
-document_retriever = None
 app_initialized = False
-token_manager = None
-
-class GigaChatTokenManager:
-    def __init__(self):
-        self.access_token = None
-        self.token_expires = None
-        self.lock = False
-        
-    def get_valid_token(self) -> str:
-        if self.access_token and self.token_expires and datetime.now() < self.token_expires:
-            return self.access_token
-        
-        if self.lock:
-            for _ in range(10):
-                time.sleep(0.1)
-                if self.access_token and datetime.now() < self.token_expires:
-                    return self.access_token
-        
-        self.lock = True
-        try:
-            self.access_token = get_gigachat_token()
-            self.token_expires = datetime.now() + timedelta(minutes=Config.TOKEN_EXPIRY_MINUTES)
-            logger.info("Токен GigaChat успешно обновлен")
-            return self.access_token
-        except Exception as e:
-            logger.error(f"Ошибка получения токена: {e}")
-            raise
-        finally:
-            self.lock = False
-    
-    def is_token_valid(self) -> bool:
-        return bool(self.access_token and self.token_expires and datetime.now() < self.token_expires)
-
-def download_certificate():
-    if Config.CERT_URL and not Path(Config.CERT_PATH).exists():
-        try:
-            response = requests.get(Config.CERT_URL, timeout=Config.REQUEST_TIMEOUT)
-            response.raise_for_status()
-            with open(Config.CERT_PATH, "wb") as f:
-                f.write(response.content)
-            logger.info("Сертификат успешно загружен")
-        except Exception as e:
-            logger.warning(f"Ошибка загрузки сертификата: {e}")
-            # Создаем пустой файл для продолжения работы
-            Path(Config.CERT_PATH).touch()
-            logger.info("Создан пустой файл сертификата для продолжения работы")
-
-@retry(stop=stop_after_attempt(Config.MAX_RETRIES), wait=wait_exponential(multiplier=1, min=2, max=10))
-def get_gigachat_token() -> str:
-    url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
-    headers = {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Accept': 'application/json',
-        'RqUID': str(uuid.uuid4()),
-        'Authorization': f'Basic {Config.GIGACHAT_AUTH}'
-    }
-    payload = {'scope': 'GIGACHAT_API_PERS'}
-    
-    verify_ssl = Path(Config.CERT_PATH).exists() and os.path.getsize(Config.CERT_PATH) > 0
-    
-    response = requests.post(
-        url, headers=headers, data=payload,
-        verify=verify_ssl, timeout=Config.REQUEST_TIMEOUT
-    )
-    response.raise_for_status()
-    return response.json().get("access_token")
-
-def initialize_models() -> Tuple[GigaChatEmbeddings, GigaChat]:
-    try:
-        access_token = token_manager.get_valid_token()
-        
-        verify_ssl = Path(Config.CERT_PATH).exists() and os.path.getsize(Config.CERT_PATH) > 0
-        ca_bundle = Config.CERT_PATH if verify_ssl else None
-        
-        embedding_model = GigaChatEmbeddings(
-            access_token=access_token, 
-            model="Embeddings", 
-            scope="GIGACHAT_API_PERS",
-            verify_ssl_certs=verify_ssl,
-            ca_bundle_file=ca_bundle,
-            timeout=Config.REQUEST_TIMEOUT
-        )
-        
-        ai_assistant = GigaChat(
-            access_token=access_token, 
-            model="GigaChat", 
-            temperature=0.2,
-            verify_ssl_certs=verify_ssl,
-            ca_bundle_file=ca_bundle,
-            timeout=Config.REQUEST_TIMEOUT, 
-            verbose=False
-        )
-        
-        return embedding_model, ai_assistant
-        
-    except Exception as e:
-        logger.error(f"Ошибка инициализации моделей: {e}")
-        raise
-
-def refresh_models():
-    global embedding_model, ai_assistant
-    try:
-        access_token = token_manager.get_valid_token()
-        
-        verify_ssl = Path(Config.CERT_PATH).exists() and os.path.getsize(Config.CERT_PATH) > 0
-        ca_bundle = Config.CERT_PATH if verify_ssl else None
-        
-        if embedding_model:
-            embedding_model.access_token = access_token
-        
-        if ai_assistant:
-            ai_assistant.access_token = access_token
-        else:
-            ai_assistant = GigaChat(
-                access_token=access_token, 
-                model="GigaChat", 
-                temperature=0.2,
-                verify_ssl_certs=verify_ssl,
-                ca_bundle_file=ca_bundle,
-                timeout=Config.REQUEST_TIMEOUT, 
-                verbose=False
-            )
-            
-        logger.info("Модели успешно обновлены с новым токеном")
-    except Exception as e:
-        logger.error(f"Ошибка обновления моделей: {e}")
-        # Не падаем, продолжаем работу в degraded mode
 
 def load_data() -> List[Document]:
     try:
@@ -236,7 +97,6 @@ def load_data() -> List[Document]:
                 df = pd.read_csv(Config.CSV_DATA_URL, on_bad_lines='skip')
             except Exception as e:
                 logger.error(f"Ошибка загрузки CSV: {e}")
-                # Пробуем создать минимальный набор данных
                 return create_fallback_data()
 
         documents = []
@@ -284,31 +144,61 @@ def create_fallback_data() -> List[Document]:
             'name': 'Суздальский кремль',
             'type': 'достопримечательность',
             'address': 'ул. Кремлевская, д. 1',
-            'description': 'Исторический центр Суздаля, древнейшее сооружение города'
+            'description': 'Исторический центр Суздаля, древнейшее сооружение города с музеями и экспозициями'
         },
         {
             'name': 'Ресторан Русская изба',
             'type': 'ресторан',
             'address': 'ул. Ленина, д. 15',
-            'description': 'Традиционная русская кухня в аутентичной обстановке'
+            'description': 'Традиционная русская кухня в аутентичной обстановке, щи, пироги, медовуха'
         },
         {
             'name': 'Гостиница Горячие ключи',
             'type': 'отель',
             'address': 'ул. Коровники, д. 45',
-            'description': 'Комфортабельный отель с бассейном и спа'
+            'description': 'Комфортабельный отель с бассейном, спа и рестораном'
         },
         {
             'name': 'Кафе Улей',
             'type': 'кафе',
             'address': 'ул. Васильевская, д. 27',
-            'description': 'Уютное кафе с домашней кухней и выпечкой'
+            'description': 'Уютное кафе с домашней кухней, свежей выпечкой и кофе'
         },
         {
             'name': 'Трапезная палата',
             'type': 'ресторан',
             'address': 'ул. Кремлевская, д. 10',
-            'description': 'Ресторан в историческом здании с русской кухней'
+            'description': 'Ресторан в историческом здании с блюдами русской кухни и европейским меню'
+        },
+        {
+            'name': 'Музей деревянного зодчества',
+            'type': 'музей',
+            'address': 'ул. Пушкарская, д. 27Б',
+            'description': 'Под открытым небом представлены уникальные памятники деревянной архитектуры'
+        },
+        {
+            'name': 'Покровский монастырь',
+            'type': 'монастырь',
+            'address': 'ул. Покровская, д. 76',
+            'description': 'Действующий женский монастырь XIV века с богатой историей'
+        },
+        {
+            'name': 'Спасо-Евфимиев монастырь',
+            'type': 'монастырь',
+            'address': 'ул. Ленина, д. 135',
+            'description': 'Мужской монастырь-крепость с музеями и колокольными звонами'
+        },
+        {
+            'name': 'Торговые ряды',
+            'type': 'достопримечательность',
+            'address': 'ул. Ленина, д. 63А',
+            'description': 'Архитектурный комплекс XIX века с сувенирными лавками и кафе'
+        },
+        {
+            'name': 'Ризоположенский монастырь',
+            'type': 'монастырь',
+            'address': 'ул. Ленина, д. 79',
+            'description': 'Один из древнейших монастырей России с Преподобенской колокольней'
         }
     ]
     
@@ -323,169 +213,127 @@ def create_fallback_data() -> List[Document]:
     logger.info(f"Создано {len(documents)} fallback документов")
     return documents
 
-@lru_cache(maxsize=100)
-def perform_web_search(query: str) -> str:
-    try:
-        results = []
-        with DDGS() as ddgs:
-            for r in ddgs.text(f"{query} Суздаль", max_results=Config.SEARCH_RESULTS, timelimit='y'):
-                results.append(f"• {r['title']}\n  {r['href']}\n  {r['body'][:200]}...")
-        return "\n\n".join(results) if results else "Не найдено результатов"
-    except Exception as e:
-        logger.error(f"Ошибка веб-поиска: {e}")
-        return "Ошибка при выполнении поиска"
-
-def search_in_vector_store(query: str, k: int = None) -> List[Document]:
-    if not vector_store:
-        return []
-    
-    try:
-        k = k or Config.RETRIEVER_K
-        results = vector_store.similarity_search(query, k=k)
-        return results
-    except Exception as e:
-        logger.error(f"Ошибка поиска в векторной базе: {e}")
-        return []
-
-def fuzzy_retrieval(question: str, docs: List[Document], limit: int = 5) -> List[Document]:
+def search_in_documents(query: str, docs: List[Document], k: int = 5) -> List[Document]:
+    """Простой поиск по документам на основе ключевых слов"""
     if not docs:
         return []
     
-    corpus = [doc.metadata.get('name', '') for doc in docs]
-    matches = process.extract(
-        question,
-        corpus,
-        scorer=fuzz.WRatio,
-        limit=limit
-    )
+    query_lower = query.lower()
     results = []
-    for match_text, score, idx in matches:
-        if score > 50:
-            results.append(docs[idx])
-    return results
+    
+    for doc in docs:
+        score = 0
+        doc_content = f"{doc.metadata.get('name', '')} {doc.metadata.get('type', '')} {doc.metadata.get('description', '')} {doc.page_content}".lower()
+        
+        # Проверяем совпадение ключевых слов
+        keywords = query_lower.split()
+        for keyword in keywords:
+            if keyword in doc_content:
+                score += 1
+        
+        # Особые случаи для популярных запросов
+        if 'есть' in query_lower or 'питание' in query_lower or 'ресторан' in query_lower or 'кафе' in query_lower:
+            if any(food_type in doc.metadata.get('type', '').lower() for food_type in ['ресторан', 'кафе', 'столовая', 'еда']):
+                score += 3
+        
+        if score > 0:
+            results.append((doc, score))
+    
+    # Сортируем по релевантности
+    results.sort(key=lambda x: x[1], reverse=True)
+    return [doc for doc, score in results[:k]]
 
-TOURISM_PROMPT_TEMPLATE = """
-Ты виртуальный гид по Суздалю. Отвечай на русском языке кратко и информативно.
-
-Информация о достопримечательностях:
-{context}
-
-Вопрос пользователя: {question}
-
-Ответь максимально полезно и точно на основе предоставленной информации.
-Если информации недостаточно, вежливо сообщи об этом.
-"""
-tourism_prompt = PromptTemplate.from_template(TOURISM_PROMPT_TEMPLATE)
-
-def generate_ai_response(db: Session, user_id: str, question: str, 
-                         context_docs: List[Document], web_results: str,
-                         conversation_summary: str, user_preferences: Dict) -> str:
+def generate_ai_response(question: str, context_docs: List[Document]) -> str:
+    """Генерация ответа на основе контекста без использования GigaChat"""
     try:
-        # Проверяем доступность GigaChat
-        if not ai_assistant or not token_manager or not token_manager.is_token_valid():
-            refresh_models()
-            if not ai_assistant:
-                return generate_fallback_response(question, context_docs)
-
+        question_lower = question.lower()
+        
         # Формируем контекст из найденных документов
         context_text = ""
         if context_docs:
             for i, doc in enumerate(context_docs[:3], 1):
                 context_text += f"\n{i}. {doc.metadata.get('name', 'Объект')}: "
                 if doc.metadata.get('description'):
-                    context_text += f"{doc.metadata['description'][:200]}... "
+                    context_text += f"{doc.metadata['description']} "
                 if doc.metadata.get('address'):
                     context_text += f"Адрес: {doc.metadata['address']} "
                 if doc.metadata.get('hours'):
                     context_text += f"Часы: {doc.metadata['hours']}"
-        else:
-            context_text = "Информация не найдена в базе данных"
-
-        # Формируем системный промпт
-        system_prompt = tourism_prompt.format(
-            question=question,
-            context=context_text or "Нет данных в базе",
-        )
-
-        # Исправленный вызов модели - используем правильный формат
-        messages = [
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=question)
-        ]
-
-        # Правильный вызов модели
-        response = ai_assistant.invoke(messages)
         
-        response_text = response.content if hasattr(response, "content") else str(response)
-        return response_text
+        # Специализированные ответы для популярных запросов
+        if any(keyword in question_lower for keyword in ['где поесть', 'еда', 'ресторан', 'кафе', 'столовая', 'питание']):
+            restaurants = [doc for doc in context_docs if any(food_type in doc.metadata.get('type', '').lower() 
+                          for food_type in ['ресторан', 'кафе', 'столовая', 'еда'])]
+            
+            if restaurants:
+                response = "🍽️ **Где поесть в Суздале:**\n\n"
+                for i, rest in enumerate(restaurants[:5], 1):
+                    response += f"**{i}. {rest.metadata.get('name', 'Заведение')}**\n"
+                    if 'address' in rest.metadata:
+                        response += f"   📍 Адрес: {rest.metadata['address']}\n"
+                    if 'description' in rest.metadata:
+                        response += f"   📝 {rest.metadata['description']}\n"
+                    response += "\n"
+                response += "\n💡 **Совет:** Большинство заведений сосредоточено в центре города вдоль улицы Ленина и вокруг Кремля. Рекомендую уточнять актуальный режим работы."
+                return response
+            else:
+                return "🍽️ В Суздале множество мест где можно вкусно поесть:\n\n• **Рестораны русской кухни** - предлагают традиционные блюда: щи, пироги, блины, медовуху\n• **Кафе в центре города** - уютные места с домашней атмосферой\n• **Трапезные при монастырях** - аутентичная атмосфера и постная кухня\n• **Гостиничные рестораны** - обычно работают до позднего вечера\n\n📍 **Район поиска:** Центр города, улица Ленина, Торговые ряды"
+
+        elif any(keyword in question_lower for keyword in ['достопримечательность', 'что посмотреть', 'куда сходить', 'музей', 'кремль']):
+            attractions = [doc for doc in context_docs if any(attr_type in doc.metadata.get('type', '').lower() 
+                            for attr_type in ['достопримечательность', 'музей', 'монастырь', 'кремль'])]
+            
+            if attractions:
+                response = "🏛️ **Достопримечательности Суздаля:**\n\n"
+                for i, attr in enumerate(attractions[:5], 1):
+                    response += f"**{i}. {attr.metadata.get('name', 'Достопримечательность')}**\n"
+                    if 'description' in attr.metadata:
+                        response += f"   📝 {attr.metadata['description']}\n"
+                    if 'address' in attr.metadata:
+                        response += f"   📍 Адрес: {attr.metadata['address']}\n"
+                    response += "\n"
+                response += "\n🎯 **Маршрут для осмотра:** Начните с Суздальского кремля, затем посетите Музей деревянного зодчества, завершите день в одном из монастырей."
+                return response
+            else:
+                return "🏛️ Суздаль - музей под открытым небом! Основные достопримечательности:\n\n• **Суздальский кремль** - сердце города с древними соборами\n• **Музей деревянного зодчества** - уникальные памятники архитектуры\n• **Покровский монастырь** - место ссылки знатных женщин\n• **Спасо-Евфимиев монастырь** - монастырь-крепость с богатой историей\n• **Торговые ряды** - архитектурный ансамбль XIX века\n• **Ризоположенский монастырь** - один из древнейших в России\n\n🚶 **Совет:** Город компактный, все主要 достопримечательности в пешей доступности."
+
+        elif any(keyword in question_lower for keyword in ['отель', 'гостиница', 'жилье', 'где остановиться', 'ночлев']):
+            hotels = [doc for doc in context_docs if any(hotel_type in doc.metadata.get('type', '').lower() 
+                       for hotel_type in ['отель', 'гостиница', 'гостевой дом'])]
+            
+            if hotels:
+                response = "🏨 **Где остановиться в Суздале:**\n\n"
+                for i, hotel in enumerate(hotels[:5], 1):
+                    response += f"**{i}. {hotel.metadata.get('name', 'Отель')}**\n"
+                    if 'address' in hotel.metadata:
+                        response += f"   📍 Адрес: {hotel.metadata['address']}\n"
+                    if 'description' in hotel.metadata:
+                        response += f"   📝 {hotel.metadata['description']}\n"
+                    response += "\n"
+                response += "\n📞 **Рекомендация:** Бронируйте заранее, особенно в выходные и праздники. Многие отели предлагают экскурсии и трансфер."
+                return response
+            else:
+                return "🏨 Варианты размещения в Суздале:\n\n• **Гостиницы в центре** - удобное расположение, но может быть шумно\n• **Загородные отели** - тишина и природа, нужен транспорт\n• **Гостевые дома** - уютная атмосфера, часто с домашней кухней\n• **Гостиницы при монастырях** - уникальный духовный опыт\n• **Частный сектор** - экономичный вариант с местным колоритом\n\n💰 **Цены:** Средняя стоимость номера 2000-5000 руб/ночь в зависимости от сезона"
+
+        # Общий интеллектуальный ответ
+        if context_docs:
+            response = f"🤔 По вашему запросу \"{question}\" я нашел следующую информацию:\n\n"
+            for i, doc in enumerate(context_docs[:3], 1):
+                response += f"**{i}. {doc.metadata.get('name', 'Объект')}**\n"
+                if 'description' in doc.metadata:
+                    response += f"   {doc.metadata['description']}\n"
+                if 'address' in doc.metadata:
+                    response += f"   📍 Адрес: {doc.metadata['address']}\n"
+                response += "\n"
+            response += "\n💡 Если вам нужна более конкретная информация, уточните пожалуйста ваш вопрос."
+            return response
+        
+        # Общий ответ если ничего не найдено
+        return "Привет! Я виртуальный гид по Суздалю. 🏛️\n\nЧем могу помочь?\n• Подсказать где поесть 🍽️\n• Посоветовать достопримечательности 🏛️\n• Помочь с выбором жилья 🏨\n• Рассказать об истории города 📖\n\nЗадайте ваш вопрос подробнее, и я постараюсь помочь!"
 
     except Exception as e:
         logger.error(f"Ошибка генерации ответа: {e}")
-        logger.error(traceback.format_exc())
-        return generate_fallback_response(question, context_docs)
-
-def generate_fallback_response(question: str, context_docs: List[Document]) -> str:
-    """Fallback ответ когда GigaChat недоступен"""
-    question_lower = question.lower()
-    
-    # Ответы про еду
-    if any(keyword in question_lower for keyword in ['где поесть', 'еда', 'ресторан', 'кафе', 'столовая', 'питание']):
-        restaurants = [doc for doc in context_docs if doc.metadata.get('type', '').lower() in 
-                      ['ресторан', 'кафе', 'столовая', 'еда', 'питание', 'food']]
-        
-        if restaurants:
-            response = "🍽️ **Где поесть в Суздале:**\n\n"
-            for i, rest in enumerate(restaurants[:5], 1):
-                response += f"**{i}. {rest.metadata.get('name', 'Заведение')}**\n"
-                if 'address' in rest.metadata:
-                    response += f"   📍 Адрес: {rest.metadata['address']}\n"
-                if 'hours' in rest.metadata:
-                    response += f"   🕒 Часы работы: {rest.metadata['hours']}\n"
-                if 'description' in rest.metadata:
-                    response += f"   📝 {rest.metadata['description'][:100]}...\n"
-                response += "\n"
-            return response + "\nРекомендую уточнить актуальный режим работы у администрации заведений."
-        else:
-            return "🍽️ В Суздале есть множество кафе и ресторанов с традиционной русской кухней. Популярные места:\n\n• **Рестораны в центре города** - предлагают блюда русской кухни\n• **Кафе на улице Ленина** - уютные места с домашней атмосферой\n• **Трапезные при монастырях** - аутентичная атмосфера\n\nРекомендую прогуляться по центру города - там вы найдете множество вариантов!"
-
-    # Ответы про достопримечательности
-    elif any(keyword in question_lower for keyword in ['достопримечательность', 'что посмотреть', 'куда сходить', 'музей', 'кремль']):
-        attractions = [doc for doc in context_docs if doc.metadata.get('type', '').lower() in 
-                      ['достопримечательность', 'музей', 'памятник', 'attraction']]
-        
-        if attractions:
-            response = "🏛️ **Достопримечательности Суздаля:**\n\n"
-            for i, attr in enumerate(attractions[:5], 1):
-                response += f"**{i}. {attr.metadata.get('name', 'Достопримечательность')}**\n"
-                if 'description' in attr.metadata:
-                    response += f"   📝 {attr.metadata['description'][:100]}...\n"
-                if 'address' in attr.metadata:
-                    response += f"   📍 Адрес: {attr.metadata['address']}\n"
-                response += "\n"
-            return response
-        else:
-            return "🏛️ Суздаль богат достопримечательностями! Обязательно посетите:\n\n• **Суздальский кремль** - исторический центр города\n• **Музей деревянного зодчества** - уникальные памятники архитектуры\n• **Покровский монастырь** - древняя обитель с богатой историей\n• **Торговые ряды** - архитектурный памятник XIX века\n• **Многочисленные церкви и храмы** - более 30 культовых сооружений"
-
-    # Ответы про жилье
-    elif any(keyword in question_lower for keyword in ['отель', 'гостиница', 'жилье', 'где остановиться', 'ночлег']):
-        hotels = [doc for doc in context_docs if doc.metadata.get('type', '').lower() in 
-                 ['отель', 'гостиница', 'hotel', 'гостевой дом']]
-        
-        if hotels:
-            response = "🏨 **Где остановиться в Суздале:**\n\n"
-            for i, hotel in enumerate(hotels[:5], 1):
-                response += f"**{i}. {hotel.metadata.get('name', 'Отель')}**\n"
-                if 'address' in hotel.metadata:
-                    response += f"   📍 Адрес: {hotel.metadata['address']}\n"
-                if 'description' in hotel.metadata:
-                    response += f"   📝 {hotel.metadata['description'][:100]}...\n"
-                response += "\n"
-            return response
-        else:
-            return "🏨 В Суздале есть различные варианты размещения:\n\n• **Гостиницы в центре города** - удобное расположение\n• **Гостевые дома** - уютная атмосфера\n• **Загородные отели** - тишина и природа\n• **Гостиницы при монастырях** - уникальный опыт\n\nРекомендую бронировать заранее, особенно в туристический сезон."
-
-    # Общий ответ
-    return "Привет! Я виртуальный гид по Суздалю. 🏛️\n\nЧем могу помочь?\n• Подсказать где поесть 🍽️\n• Посоветовать достопримечательности 🏛️\n• Помочь с выбором жилья 🏨\n• Рассказать об истории города 📖\n\nЗадайте ваш вопрос, и я постараюсь помочь!"
+        return "Извините, возникла техническая ошибка. Попробуйте задать вопрос еще раз."
 
 def handle_question(db: Session, question: str, user_id: str) -> str:
     if not app_initialized:
@@ -506,18 +354,11 @@ def handle_question(db: Session, question: str, user_id: str) -> str:
     db.add(Message(session_id=user_id, role="user", content=question, timestamp=datetime.utcnow()))
     db.commit()
 
-    user_preferences = session.user_preferences if session and session.user_preferences else {}
-    conversation_summary = session.conversation_summary if session else ""
-
     # Ищем релевантную информацию
-    context_docs = []
-    if vector_store:
-        context_docs = search_in_vector_store(question)
-    if not context_docs and documents:
-        context_docs = fuzzy_retrieval(question, documents, limit=Config.RETRIEVER_K)
+    context_docs = search_in_documents(question, documents, k=Config.RETRIEVER_K)
 
     # Генерируем ответ
-    ai_answer = generate_ai_response(db, user_id, question, context_docs, "", conversation_summary, user_preferences)
+    ai_answer = generate_ai_response(question, context_docs)
 
     # Сохраняем ответ ассистента
     db.add(Message(session_id=user_id, role="assistant", content=ai_answer, timestamp=datetime.utcnow()))
@@ -601,48 +442,20 @@ def safe_init_db():
 safe_init_db()
 
 def initialize_app():
-    global embedding_model, ai_assistant, documents, vector_store, document_retriever, app_initialized, token_manager
+    global documents, app_initialized
     
     try:
-        # Загружаем сертификат
-        download_certificate()
-        
-        # Инициализируем токен менеджер
-        token_manager = GigaChatTokenManager()
-        
-        # Пытаемся инициализировать модели
-        try:
-            embedding_model, ai_assistant = initialize_models()
-            logger.info("Модели GigaChat успешно инициализированы")
-        except Exception as model_error:
-            logger.error(f"Ошибка инициализации моделей GigaChat: {model_error}")
-            ai_assistant = None
-            embedding_model = None
-        
         # Загружаем данные
         documents = load_data()
         
-        # Создаем векторное хранилище если есть модели и данные
-        if documents and embedding_model:
-            try:
-                vector_store = FAISS.from_documents(documents, embedding_model)
-                document_retriever = vector_store.as_retriever(search_kwargs={"k": Config.RETRIEVER_K})
-                logger.info(f"Векторное хранилище создано, {len(documents)} документов")
-            except Exception as vector_error:
-                logger.error(f"Ошибка создания векторного хранилища: {vector_error}")
-                vector_store = None
-                document_retriever = None
-        else:
-            logger.warning("Векторное хранилище не создано (нет данных или моделей)")
-        
         app_initialized = True
-        logger.info("Приложение инициализировано")
+        logger.info(f"Приложение инициализировано, загружено {len(documents)} документов")
         
     except Exception as e:
         logger.critical(f"Критическая ошибка инициализации: {e}")
         logger.error(traceback.format_exc())
         documents = create_fallback_data()
-        app_initialized = True  # Все равно запускаем в fallback режиме
+        app_initialized = True
 
 initialize_app()
 
@@ -681,8 +494,7 @@ async def health_check():
         "initialized": app_initialized,
         "timestamp": datetime.utcnow(),
         "documents_loaded": len(documents),
-        "gigachat_available": ai_assistant is not None,
-        "vector_store_available": vector_store is not None
+        "service": "suzdal_tourism_assistant"
     }
 
 if __name__ == "__main__":
