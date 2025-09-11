@@ -303,23 +303,23 @@ def build_gigachat_messages(db: Session, user_id: str, current_question: str) ->
     return chat_history
 
 TOURISM_PROMPT_TEMPLATE = """
-Ты виртуальный гид по Суздалю. Учитывай контекст предыдущего диалога и предпочтения пользователя.
+Ты виртуальный гид по Суздалю. Всегда предлагай пользователю поискать дополнительную информацию в интернете, даже если нашел что-то в локальной базе.
 
-[Семантическая память диалога]:
-{conversation_summary}
-
-[Предпочтения пользователя]:
-{user_preferences}
-
-[Данные из базы о достопримечательностях]:
+[Информация из локальной базы]:
 {context}
 
 [Веб-результаты]:
 {web_search}
 
+[Предпочтения пользователя]:
+{user_preferences}
+
 Отвечай на русском языке. Будь полезным, дружелюбным и информативным гидом.
+Всегда в конце ответа предложи поискать более актуальную информацию в интернете.
+
 Отвечай на вопрос: {question}
 """
+
 tourism_prompt = PromptTemplate.from_template(TOURISM_PROMPT_TEMPLATE)
 
 def generate_ai_response(db: Session, user_id: str, question: str, 
@@ -337,24 +337,24 @@ def generate_ai_response(db: Session, user_id: str, question: str,
                 address = doc.metadata.get('address', 'Адрес не указан')
                 description = doc.page_content[:300] + "..." if len(doc.page_content) > 300 else doc.page_content
                 context_text += f"{i}. {name}\n   Адрес: {address}\n   Описание: {description}\n\n"
+        else:
+            context_text = "К сожалению, в моей локальной базе нет информации по вашему запросу."
 
         # Создаем системный промпт
         system_prompt_text = tourism_prompt.format(
             question=question,
-            context=context_text if context_text else "Нет релевантных данных в локальной базе о достопримечательностях Суздаля.",
-            web_search=web_results if web_results else "Актуальные результаты веб-поиска не требуются для этого запроса или недоступны.",
-            conversation_summary=conversation_summary or "Нет истории диалога",
+            context=context_text,
+            web_search=web_results if web_results else "Я могу поискать актуальную информацию в интернете для вас.",
             user_preferences=json.dumps(user_preferences, ensure_ascii=False, indent=2) if user_preferences else "Предпочтения пользователя не указаны"
         )
 
         # Создаем сообщения в правильном формате для GigaChat
         system_message = SystemMessage(content=system_prompt_text)
-        user_message = HumanMessage(content=question)
         
         # Получаем историю чата
         chat_history = build_gigachat_messages(db, user_id, question)
         
-        # Формируем финальный список сообщений: системный промпт + история + текущий вопрос
+        # Формируем финальный список сообщений: системный промпт + история
         all_messages = [system_message] + chat_history
         
         # Вызываем модель с правильным форматом ввода
@@ -396,16 +396,9 @@ def handle_question(db: Session, question: str, user_id: str) -> str:
         context_docs = fuzzy_retrieval(question, documents, limit=Config.RETRIEVER_K)
     
     web_results = ""
-    # 3. Определяем, нужен ли веб-поиск
-    requires_web_search = (
-        not context_docs or 
-        any(keyword in question.lower() for keyword in 
-            ['новости', 'события', 'мероприятия', 'отзыв', 'акция', 'погода', 'цена', 'стоимость', 'билет', 'расписание'])
-    )
-    
-    if requires_web_search:
-        web_results = perform_web_search(question)
-        logger.info(f"Выполнен веб-поиск по запросу: {question}")
+    # 3. Всегда выполняем веб-поиск для актуальной информации
+    web_results = perform_web_search(question)
+    logger.info(f"Выполнен веб-поиск по запросу: {question}")
 
     # 4. Генерируем ответ
     ai_answer = generate_ai_response(db, user_id, question, context_docs, web_results, conversation_summary, user_preferences)
