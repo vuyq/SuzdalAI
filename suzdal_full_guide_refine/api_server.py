@@ -52,6 +52,7 @@ class ChatSession(Base):
     clarification_context = Column(JSON, nullable=True)
     waiting_for_clarification = Column(JSON, nullable=True)
     waiting_for_internet_search = Column(Boolean, default=False)
+    conversation_history = Column(JSON, default=[])  # Новое поле для истории диалога
     messages = relationship("Message", back_populates="session", cascade="all, delete-orphan")
 
 class Message(Base):
@@ -86,6 +87,7 @@ class Config:
     SEMANTIC_SEARCH_K = 3
     SEARCH_API_KEY = os.getenv("SEARCH_API_KEY")
     SEARCH_ENGINE_ID = os.getenv("SEARCH_ENGINE_ID")
+    MAX_HISTORY_LENGTH = 10  # Максимальная длина истории диалога
 
 # Глобальные переменные
 documents = []
@@ -305,14 +307,41 @@ def needs_clarification(question: str) -> Tuple[bool, Optional[str]]:
     
     return False, None
 
-def generate_ai_response(question: str, context_docs: List[Document], session_data: Optional[Dict] = None) -> str:
+def get_conversation_context(session: ChatSession) -> str:
+    """Получает контекст из истории диалога"""
+    if not session.conversation_history:
+        return ""
+    
+    context = "Контекст предыдущего диалога:\n"
+    for i, msg in enumerate(session.conversation_history[-Config.MAX_HISTORY_LENGTH:], 1):
+        role = "Пользователь" if msg['role'] == 'user' else "Ассистент"
+        context += f"{i}. {role}: {msg['content']}\n"
+    
+    return context
+
+def update_conversation_history(session: ChatSession, role: str, content: str):
+    """Обновляет историю диалога"""
+    if session.conversation_history is None:
+        session.conversation_history = []
+    
+    session.conversation_history.append({
+        'role': role,
+        'content': content,
+        'timestamp': datetime.utcnow().isoformat()
+    })
+    
+    # Ограничиваем длину истории
+    if len(session.conversation_history) > Config.MAX_HISTORY_LENGTH:
+        session.conversation_history = session.conversation_history[-Config.MAX_HISTORY_LENGTH:]
+
+def generate_ai_response(question: str, context_docs: List[Document], session_data: Optional[Dict] = None, conversation_context: str = "") -> str:
     """Генерация ответа на основе контекста"""
     try:
         question_lower = question.lower()
         
         # Проверяем, ждем ли мы ответ о поиске в интернете
         if session_data and session_data.get('waiting_for_internet_search'):
-            if any(word in question_lower for word in ['да', 'yes', 'конечно', 'пожалуйста', 'ищи']):
+            if any(word in question_lower for word in ['да', 'yes', 'конечно', 'пожалуйста', 'ищи', 'найди']):
                 # Ищем в интернете
                 internet_results = search_internet(session_data.get('last_question', ''))
                 if internet_results:
@@ -325,17 +354,18 @@ def generate_ai_response(question: str, context_docs: List[Document], session_da
         # Проверяем, ждем ли мы уточнения
         if session_data and session_data.get('waiting_for_clarification'):
             # Обрабатываем уточняющий ответ пользователя
-            clarified_question = f"{session_data.get('last_question', '')} {question}"
-            context_docs = search_in_documents(clarified_question, documents, k=Config.RETRIEVER_K)
-            return generate_final_response(clarified_question, context_docs)
+            original_question = session_data.get('original_question', '')
+            full_question = f"{original_question} {question}"
+            context_docs = search_in_documents(full_question, documents, k=Config.RETRIEVER_K)
+            return generate_final_response(full_question, context_docs, conversation_context)
         
         # Проверяем, нуждается ли вопрос в уточнении
         needs_clarify, clarification_msg = needs_clarification(question)
         if needs_clarify:
-            return f"{generate_preliminary_response(question, context_docs)}\n\n{clarification_msg}"
+            return f"{generate_preliminary_response(question, context_docs, conversation_context)}\n\n{clarification_msg}"
         
         # Формируем окончательный ответ
-        response = generate_final_response(question, context_docs)
+        response = generate_final_response(question, context_docs, conversation_context)
         
         # Предлагаем поиск в интернете, если ответ неполный
         if len(context_docs) < 2 and not any(keyword in question_lower for keyword in ['привет', 'hello', 'hi', 'начать']):
@@ -347,7 +377,7 @@ def generate_ai_response(question: str, context_docs: List[Document], session_da
         logger.error(f"Ошибка генерации ответа: {e}")
         return "Извините, возникла техническая ошибка. Попробуйте задать вопрос еще раз."
 
-def generate_preliminary_response(question: str, context_docs: List[Document]) -> str:
+def generate_preliminary_response(question: str, context_docs: List[Document], conversation_context: str = "") -> str:
     """Генерация предварительного ответа"""
     question_lower = question.lower()
     
@@ -360,30 +390,27 @@ def generate_preliminary_response(question: str, context_docs: List[Document]) -
     else:
         return "У меня есть информация по вашему запросу!"
 
-def generate_final_response(question: str, context_docs: List[Document]) -> str:
+def generate_final_response(question: str, context_docs: List[Document], conversation_context: str = "") -> str:
     """Генерация окончательного ответа на основе контекста"""
     question_lower = question.lower()
     
-    # Формируем контекст из найденных документов
-    context_text = ""
-    if context_docs:
-        for i, doc in enumerate(context_docs[:3], 1):
-            context_text += f"\n{i}. {doc.metadata.get('name', 'Объект')}: "
-            if doc.metadata.get('description'):
-                context_text += f"{doc.metadata['description']} "
-            if doc.metadata.get('address'):
-                context_text += f"Адрес: {doc.metadata['address']} "
-            if doc.metadata.get('hours'):
-                context_text += f"Часы: {doc.metadata['hours']}"
+    # Используем контекст диалога для лучшего понимания
+    full_context = f"{conversation_context}\n\nТекущий вопрос: {question}"
     
-    # Специализированные ответы
-    if any(keyword in question_lower for keyword in ['где поесть', 'еда', 'ресторан', 'кафе', 'столовая', 'питание']):
+    # Специализированные ответы с учетом контекста
+    if any(keyword in question_lower for keyword in ['где поесть', 'еда', 'ресторан', 'кафе', 'столовая', 'питание']) or 'кухн' in full_context.lower():
         restaurants = [doc for doc in context_docs if any(food_type in doc.metadata.get('type', '').lower() 
                       for food_type in ['ресторан', 'кафе', 'столовая', 'еда'])]
         
-        if restaurants:
+        # Фильтрация по кухне, если указана в контексте
+        filtered_restaurants = restaurants
+        if 'русск' in full_context.lower():
+            filtered_restaurants = [r for r in restaurants if any(cuisine in r.metadata.get('description', '').lower() 
+                                 for cuisine in ['русск', 'традиционн', 'щи', 'блины', 'пироги'])]
+        
+        if filtered_restaurants:
             response = "🍽️ **Где поесть в Суздале:**\n\n"
-            for i, rest in enumerate(restaurants[:5], 1):
+            for i, rest in enumerate(filtered_restaurants[:5], 1):
                 response += f"**{i}. {rest.metadata.get('name', 'Заведение')}**\n"
                 if 'address' in rest.metadata:
                     response += f"   📍 Адрес: {rest.metadata['address']}\n"
@@ -458,6 +485,9 @@ def handle_question(db: Session, question: str, user_id: str) -> str:
         db.add(session)
         db.commit()
 
+    # Получаем контекст диалога
+    conversation_context = get_conversation_context(session)
+
     # Проверяем, ждем ли мы ответа о поиске в интернете
     if session.waiting_for_internet_search:
         session.waiting_for_internet_search = False
@@ -465,6 +495,7 @@ def handle_question(db: Session, question: str, user_id: str) -> str:
         
         # Сохраняем ответ пользователя
         db.add(Message(session_id=user_id, role="user", content=question, timestamp=datetime.utcnow()))
+        update_conversation_history(session, 'user', question)
         db.commit()
         
         # Генерируем ответ на основе предыдущего вопроса
@@ -472,32 +503,37 @@ def handle_question(db: Session, question: str, user_id: str) -> str:
         ai_answer = generate_ai_response(question, context_docs, {
             'waiting_for_internet_search': True,
             'last_question': session.last_question
-        })
+        }, conversation_context)
         
         # Сохраняем ответ ассистента
         db.add(Message(session_id=user_id, role="assistant", content=ai_answer, timestamp=datetime.utcnow()))
+        update_conversation_history(session, 'assistant', ai_answer)
         db.commit()
         
         return ai_answer
 
     # Проверяем, ждем ли мы уточнения
     if session.waiting_for_clarification:
+        original_question = session.waiting_for_clarification.get('original_question', '')
         session.waiting_for_clarification = None
         db.commit()
         
         # Сохраняем уточняющий ответ пользователя
         db.add(Message(session_id=user_id, role="user", content=question, timestamp=datetime.utcnow()))
+        update_conversation_history(session, 'user', question)
         db.commit()
         
         # Объединяем с предыдущим вопросом
-        full_question = f"{session.last_question} {question}"
+        full_question = f"{original_question} {question}"
         context_docs = search_in_documents(full_question, documents, k=Config.RETRIEVER_K)
         ai_answer = generate_ai_response(full_question, context_docs, {
-            'waiting_for_clarification': True
-        })
+            'waiting_for_clarification': True,
+            'original_question': original_question
+        }, conversation_context)
         
         # Сохраняем ответ ассистента
         db.add(Message(session_id=user_id, role="assistant", content=ai_answer, timestamp=datetime.utcnow()))
+        update_conversation_history(session, 'assistant', ai_answer)
         db.commit()
         
         # Предлагаем поиск в интернете, если ответ неполный
@@ -515,6 +551,7 @@ def handle_question(db: Session, question: str, user_id: str) -> str:
 
     # Сохраняем вопрос пользователя
     db.add(Message(session_id=user_id, role="user", content=question, timestamp=datetime.utcnow()))
+    update_conversation_history(session, 'user', question)
     db.commit()
 
     # Ищем релевантную информацию
@@ -527,11 +564,11 @@ def handle_question(db: Session, question: str, user_id: str) -> str:
         db.commit()
         
         # Генерируем ответ с просьбой об уточнении
-        preliminary_response = generate_preliminary_response(question, context_docs)
+        preliminary_response = generate_preliminary_response(question, context_docs, conversation_context)
         ai_answer = f"{preliminary_response}\n\n{clarification_msg}"
     else:
         # Генерируем обычный ответ
-        ai_answer = generate_ai_response(question, context_docs)
+        ai_answer = generate_ai_response(question, context_docs, {}, conversation_context)
         
         # Предлагаем поиск в интернете, если ответ неполный
         if len(context_docs) < 2 and not any(keyword in question.lower() for keyword in ['привет', 'hello', 'hi', 'начать']):
@@ -541,6 +578,7 @@ def handle_question(db: Session, question: str, user_id: str) -> str:
 
     # Сохраняем ответ ассистента
     db.add(Message(session_id=user_id, role="assistant", content=ai_answer, timestamp=datetime.utcnow()))
+    update_conversation_history(session, 'assistant', ai_answer)
     db.commit()
 
     return ai_answer
@@ -570,6 +608,9 @@ def safe_init_db():
                 
                 if 'waiting_for_internet_search' not in chat_columns:
                     conn.execute(text("ALTER TABLE chat_sessions ADD COLUMN waiting_for_internet_search BOOLEAN DEFAULT FALSE"))
+                
+                if 'conversation_history' not in chat_columns:
+                    conn.execute(text("ALTER TABLE chat_sessions ADD COLUMN conversation_history JSONB DEFAULT '[]'"))
                 
                 conn.commit()
                 
