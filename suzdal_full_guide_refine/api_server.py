@@ -50,6 +50,8 @@ class ChatSession(Base):
     user_preferences = Column(JSON, nullable=True)
     conversation_summary = Column(Text, nullable=True)
     clarification_context = Column(JSON, nullable=True)
+    waiting_for_clarification = Column(JSON, nullable=True)
+    waiting_for_internet_search = Column(Boolean, default=False)
     messages = relationship("Message", back_populates="session", cascade="all, delete-orphan")
 
 class Message(Base):
@@ -82,6 +84,8 @@ class Config:
     MEMORY_CONTEXT_SIZE = 10
     PREFERENCES_UPDATE_INTERVAL = 5
     SEMANTIC_SEARCH_K = 3
+    SEARCH_API_KEY = os.getenv("SEARCH_API_KEY")
+    SEARCH_ENGINE_ID = os.getenv("SEARCH_ENGINE_ID")
 
 # Глобальные переменные
 documents = []
@@ -243,97 +247,201 @@ def search_in_documents(query: str, docs: List[Document], k: int = 5) -> List[Do
     results.sort(key=lambda x: x[1], reverse=True)
     return [doc for doc, score in results[:k]]
 
-def generate_ai_response(question: str, context_docs: List[Document]) -> str:
-    """Генерация ответа на основе контекста без использования GigaChat"""
+def search_internet(query: str) -> Optional[str]:
+    """Поиск информации в интернете с использованием Google Search API"""
+    try:
+        if not Config.SEARCH_API_KEY or not Config.SEARCH_ENGINE_ID:
+            logger.warning("API ключи для поиска не настроены")
+            return None
+            
+        url = "https://www.googleapis.com/customsearch/v1"
+        params = {
+            'key': Config.SEARCH_API_KEY,
+            'cx': Config.SEARCH_ENGINE_ID,
+            'q': f"{query} Суздаль",
+            'num': 3
+        }
+        
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        
+        data = response.json()
+        if 'items' in data and data['items']:
+            results = []
+            for item in data['items'][:3]:
+                title = item.get('title', '')
+                snippet = item.get('snippet', '')
+                results.append(f"{title}: {snippet}")
+            
+            return "\n\n".join(results)
+        
+        return None
+        
+    except Exception as e:
+        logger.error(f"Ошибка поиска в интернете: {e}")
+        return None
+
+def needs_clarification(question: str) -> Tuple[bool, Optional[str]]:
+    """Определяет, нуждается ли вопрос в уточнении"""
+    question_lower = question.lower()
+    
+    # Общие вопросы, требующие уточнения
+    vague_questions = [
+        'где поесть', 'что посмотреть', 'куда сходить', 
+        'где остановиться', 'что делать', 'что интересного',
+        'рекомендации', 'советы', 'посоветуйте'
+    ]
+    
+    for vague_q in vague_questions:
+        if vague_q in question_lower:
+            if 'где поесть' in question_lower:
+                return True, "Какую кухню вы предпочитаете? Или может быть у вас есть предпочтения по бюджету?"
+            elif 'что посмотреть' in question_lower or 'куда сходить' in question_lower:
+                return True, "Вас больше интересуют исторические достопримечательности, музеи или, может быть, природные красоты?"
+            elif 'где остановиться' in question_lower:
+                return True, "Какой тип размещения вы предпочитаете? Отель, гостевой дом или что-то другое? И какой у вас бюджет?"
+            else:
+                return True, "Не могли бы вы уточнить, что именно вас интересует? Это поможет мне дать более точный ответ."
+    
+    return False, None
+
+def generate_ai_response(question: str, context_docs: List[Document], session_data: Optional[Dict] = None) -> str:
+    """Генерация ответа на основе контекста"""
     try:
         question_lower = question.lower()
         
-        # Формируем контекст из найденных документов
-        context_text = ""
-        if context_docs:
-            for i, doc in enumerate(context_docs[:3], 1):
-                context_text += f"\n{i}. {doc.metadata.get('name', 'Объект')}: "
-                if doc.metadata.get('description'):
-                    context_text += f"{doc.metadata['description']} "
-                if doc.metadata.get('address'):
-                    context_text += f"Адрес: {doc.metadata['address']} "
-                if doc.metadata.get('hours'):
-                    context_text += f"Часы: {doc.metadata['hours']}"
+        # Проверяем, ждем ли мы ответ о поиске в интернете
+        if session_data and session_data.get('waiting_for_internet_search'):
+            if any(word in question_lower for word in ['да', 'yes', 'конечно', 'пожалуйста', 'ищи']):
+                # Ищем в интернете
+                internet_results = search_internet(session_data.get('last_question', ''))
+                if internet_results:
+                    return f"🔍 **Результаты поиска в интернете:**\n\n{internet_results}\n\nНадеюсь, эта информация была полезной! 😊"
+                else:
+                    return "К сожалению, мне не удалось найти дополнительную информацию в интернете по вашему запросу. 😔"
+            else:
+                return "Хорошо! Я рад, что смог помочь вам с имеющейся информацией. Если у вас будут еще вопросы о Суздале - обращайтесь! 🏛️"
         
-        # Специализированные ответы для популярных запросов
-        if any(keyword in question_lower for keyword in ['где поесть', 'еда', 'ресторан', 'кафе', 'столовая', 'питание']):
-            restaurants = [doc for doc in context_docs if any(food_type in doc.metadata.get('type', '').lower() 
-                          for food_type in ['ресторан', 'кафе', 'столовая', 'еда'])]
-            
-            if restaurants:
-                response = "🍽️ **Где поесть в Суздале:**\n\n"
-                for i, rest in enumerate(restaurants[:5], 1):
-                    response += f"**{i}. {rest.metadata.get('name', 'Заведение')}**\n"
-                    if 'address' in rest.metadata:
-                        response += f"   📍 Адрес: {rest.metadata['address']}\n"
-                    if 'description' in rest.metadata:
-                        response += f"   📝 {rest.metadata['description']}\n"
-                    response += "\n"
-                response += "\n💡 **Совет:** Большинство заведений сосредоточено в центре города вдоль улицы Ленина и вокруг Кремля. Рекомендую уточнять актуальный режим работы."
-                return response
-            else:
-                return "🍽️ В Суздале множество мест где можно вкусно поесть:\n\n• **Рестораны русской кухни** - предлагают традиционные блюда: щи, пироги, блины, медовуху\n• **Кафе в центре города** - уютные места с домашней атмосферой\n• **Трапезные при монастырях** - аутентичная атмосфера и постная кухня\n• **Гостиничные рестораны** - обычно работают до позднего вечера\n\n📍 **Район поиска:** Центр города, улица Ленина, Торговые ряды"
-
-        elif any(keyword in question_lower for keyword in ['достопримечательность', 'что посмотреть', 'куда сходить', 'музей', 'кремль']):
-            attractions = [doc for doc in context_docs if any(attr_type in doc.metadata.get('type', '').lower() 
-                            for attr_type in ['достопримечательность', 'музей', 'монастырь', 'кремль'])]
-            
-            if attractions:
-                response = "🏛️ **Достопримечательности Суздаля:**\n\n"
-                for i, attr in enumerate(attractions[:5], 1):
-                    response += f"**{i}. {attr.metadata.get('name', 'Достопримечательность')}**\n"
-                    if 'description' in attr.metadata:
-                        response += f"   📝 {attr.metadata['description']}\n"
-                    if 'address' in attr.metadata:
-                        response += f"   📍 Адрес: {attr.metadata['address']}\n"
-                    response += "\n"
-                response += "\n🎯 **Маршрут для осмотра:** Начните с Суздальского кремля, затем посетите Музей деревянного зодчества, завершите день в одном из монастырей."
-                return response
-            else:
-                return "🏛️ Суздаль - музей под открытым небом! Основные достопримечательности:\n\n• **Суздальский кремль** - сердце города с древними соборами\n• **Музей деревянного зодчества** - уникальные памятники архитектуры\n• **Покровский монастырь** - место ссылки знатных женщин\n• **Спасо-Евфимиев монастырь** - монастырь-крепость с богатой историей\n• **Торговые ряды** - архитектурный ансамбль XIX века\n• **Ризоположенский монастырь** - один из древнейших в России\n\n🚶 **Совет:** Город компактный, все主要 достопримечательности в пешей доступности."
-
-        elif any(keyword in question_lower for keyword in ['отель', 'гостиница', 'жилье', 'где остановиться', 'ночлев']):
-            hotels = [doc for doc in context_docs if any(hotel_type in doc.metadata.get('type', '').lower() 
-                       for hotel_type in ['отель', 'гостиница', 'гостевой дом'])]
-            
-            if hotels:
-                response = "🏨 **Где остановиться в Суздале:**\n\n"
-                for i, hotel in enumerate(hotels[:5], 1):
-                    response += f"**{i}. {hotel.metadata.get('name', 'Отель')}**\n"
-                    if 'address' in hotel.metadata:
-                        response += f"   📍 Адрес: {hotel.metadata['address']}\n"
-                    if 'description' in hotel.metadata:
-                        response += f"   📝 {hotel.metadata['description']}\n"
-                    response += "\n"
-                response += "\n📞 **Рекомендация:** Бронируйте заранее, особенно в выходные и праздники. Многие отели предлагают экскурсии и трансфер."
-                return response
-            else:
-                return "🏨 Варианты размещения в Суздале:\n\n• **Гостиницы в центре** - удобное расположение, но может быть шумно\n• **Загородные отели** - тишина и природа, нужен транспорт\n• **Гостевые дома** - уютная атмосфера, часто с домашней кухней\n• **Гостиницы при монастырях** - уникальный духовный опыт\n• **Частный сектор** - экономичный вариант с местным колоритом\n\n💰 **Цены:** Средняя стоимость номера 2000-5000 руб/ночь в зависимости от сезона"
-
-        # Общий интеллектуальный ответ
-        if context_docs:
-            response = f"🤔 По вашему запросу \"{question}\" я нашел следующую информацию:\n\n"
-            for i, doc in enumerate(context_docs[:3], 1):
-                response += f"**{i}. {doc.metadata.get('name', 'Объект')}**\n"
-                if 'description' in doc.metadata:
-                    response += f"   {doc.metadata['description']}\n"
-                if 'address' in doc.metadata:
-                    response += f"   📍 Адрес: {doc.metadata['address']}\n"
-                response += "\n"
-            response += "\n💡 Если вам нужна более конкретная информация, уточните пожалуйста ваш вопрос."
-            return response
+        # Проверяем, ждем ли мы уточнения
+        if session_data and session_data.get('waiting_for_clarification'):
+            # Обрабатываем уточняющий ответ пользователя
+            clarified_question = f"{session_data.get('last_question', '')} {question}"
+            context_docs = search_in_documents(clarified_question, documents, k=Config.RETRIEVER_K)
+            return generate_final_response(clarified_question, context_docs)
         
-        # Общий ответ если ничего не найдено
-        return "Привет! Я виртуальный гид по Суздалю. 🏛️\n\nЧем могу помочь?\n• Подсказать где поесть 🍽️\n• Посоветовать достопримечательности 🏛️\n• Помочь с выбором жилья 🏨\n• Рассказать об истории города 📖\n\nЗадайте ваш вопрос подробнее, и я постараюсь помочь!"
-
+        # Проверяем, нуждается ли вопрос в уточнении
+        needs_clarify, clarification_msg = needs_clarification(question)
+        if needs_clarify:
+            return f"{generate_preliminary_response(question, context_docs)}\n\n{clarification_msg}"
+        
+        # Формируем окончательный ответ
+        response = generate_final_response(question, context_docs)
+        
+        # Предлагаем поиск в интернете, если ответ неполный
+        if len(context_docs) < 2 and not any(keyword in question_lower for keyword in ['привет', 'hello', 'hi', 'начать']):
+            response += "\n\n🤔 Хотите, чтобы я поискал дополнительную информацию в интернете?"
+        
+        return response
+        
     except Exception as e:
         logger.error(f"Ошибка генерации ответа: {e}")
         return "Извините, возникла техническая ошибка. Попробуйте задать вопрос еще раз."
+
+def generate_preliminary_response(question: str, context_docs: List[Document]) -> str:
+    """Генерация предварительного ответа"""
+    question_lower = question.lower()
+    
+    if any(keyword in question_lower for keyword in ['где поесть', 'еда', 'ресторан', 'кафе']):
+        return "🍽️ В Суздале есть множество прекрасных мест где можно поесть!"
+    elif any(keyword in question_lower for keyword in ['достопримечательность', 'что посмотреть', 'музей']):
+        return "🏛️ Суздаль богат интересными достопримечательностями!"
+    elif any(keyword in question_lower for keyword in ['отель', 'гостиница', 'жилье']):
+        return "🏨 В Суздале есть различные варианты размещения!"
+    else:
+        return "У меня есть информация по вашему запросу!"
+
+def generate_final_response(question: str, context_docs: List[Document]) -> str:
+    """Генерация окончательного ответа на основе контекста"""
+    question_lower = question.lower()
+    
+    # Формируем контекст из найденных документов
+    context_text = ""
+    if context_docs:
+        for i, doc in enumerate(context_docs[:3], 1):
+            context_text += f"\n{i}. {doc.metadata.get('name', 'Объект')}: "
+            if doc.metadata.get('description'):
+                context_text += f"{doc.metadata['description']} "
+            if doc.metadata.get('address'):
+                context_text += f"Адрес: {doc.metadata['address']} "
+            if doc.metadata.get('hours'):
+                context_text += f"Часы: {doc.metadata['hours']}"
+    
+    # Специализированные ответы
+    if any(keyword in question_lower for keyword in ['где поесть', 'еда', 'ресторан', 'кафе', 'столовая', 'питание']):
+        restaurants = [doc for doc in context_docs if any(food_type in doc.metadata.get('type', '').lower() 
+                      for food_type in ['ресторан', 'кафе', 'столовая', 'еда'])]
+        
+        if restaurants:
+            response = "🍽️ **Где поесть в Суздале:**\n\n"
+            for i, rest in enumerate(restaurants[:5], 1):
+                response += f"**{i}. {rest.metadata.get('name', 'Заведение')}**\n"
+                if 'address' in rest.metadata:
+                    response += f"   📍 Адрес: {rest.metadata['address']}\n"
+                if 'description' in rest.metadata:
+                    response += f"   📝 {rest.metadata['description']}\n"
+                response += "\n"
+            return response
+        else:
+            return "🍽️ В Суздале множество мест где можно вкусно поесть. Рекомендую уточнить ваши предпочтения по кухне или бюджету."
+
+    elif any(keyword in question_lower for keyword in ['достопримечательность', 'что посмотреть', 'куда сходить', 'музей', 'кремль']):
+        attractions = [doc for doc in context_docs if any(attr_type in doc.metadata.get('type', '').lower() 
+                        for attr_type in ['достопримечательность', 'музей', 'монастырь', 'кремль'])]
+        
+        if attractions:
+            response = "🏛️ **Достопримечательности Суздаля:**\n\n"
+            for i, attr in enumerate(attractions[:5], 1):
+                response += f"**{i}. {attr.metadata.get('name', 'Достопримечательность')}**\n"
+                if 'description' in attr.metadata:
+                    response += f"   📝 {attr.metadata['description']}\n"
+                if 'address' in attr.metadata:
+                    response += f"   📍 Адрес: {attr.metadata['address']}\n"
+                response += "\n"
+            return response
+        else:
+            return "🏛️ Суздаль богат достопримечательностями! Уточните, что именно вас интересует: история, архитектура, музеи?"
+
+    elif any(keyword in question_lower for keyword in ['отель', 'гостиница', 'жилье', 'где остановиться', 'ночлев']):
+        hotels = [doc for doc in context_docs if any(hotel_type in doc.metadata.get('type', '').lower() 
+                   for hotel_type in ['отель', 'гостиница', 'гостевой дом'])]
+        
+        if hotels:
+            response = "🏨 **Где остановиться в Суздале:**\n\n"
+            for i, hotel in enumerate(hotels[:5], 1):
+                response += f"**{i}. {hotel.metadata.get('name', 'Отель')}**\n"
+                if 'address' in hotel.metadata:
+                    response += f"   📍 Адрес: {hotel.metadata['address']}\n"
+                if 'description' in hotel.metadata:
+                    response += f"   📝 {hotel.metadata['description']}\n"
+                response += "\n"
+            return response
+        else:
+            return "🏨 В Суздале есть различные варианты размещения. Уточните ваш бюджет или предпочтения по типу жилья."
+
+    # Общий ответ
+    if context_docs:
+        response = f"🤔 По вашему запросу \"{question}\" я нашел:\n\n"
+        for i, doc in enumerate(context_docs[:3], 1):
+            response += f"**{i}. {doc.metadata.get('name', 'Объект')}**\n"
+            if 'description' in doc.metadata:
+                response += f"   {doc.metadata['description']}\n"
+            if 'address' in doc.metadata:
+                response += f"   📍 Адрес: {doc.metadata['address']}\n"
+            response += "\n"
+        return response
+    
+    # Общий ответ если ничего не найдено
+    return "Привет! Я виртуальный гид по Суздалю. 🏛️\n\nЧем могу помочь?\n• Подсказать где поесть 🍽️\n• Посоветовать достопримечательности 🏛️\n• Помочь с выбором жилья 🏨\n• Рассказать об истории города 📖\n\nЗадайте ваш вопрос подробнее, и я постараюсь помочь!"
 
 def handle_question(db: Session, question: str, user_id: str) -> str:
     if not app_initialized:
@@ -350,6 +458,61 @@ def handle_question(db: Session, question: str, user_id: str) -> str:
         db.add(session)
         db.commit()
 
+    # Проверяем, ждем ли мы ответа о поиске в интернете
+    if session.waiting_for_internet_search:
+        session.waiting_for_internet_search = False
+        db.commit()
+        
+        # Сохраняем ответ пользователя
+        db.add(Message(session_id=user_id, role="user", content=question, timestamp=datetime.utcnow()))
+        db.commit()
+        
+        # Генерируем ответ на основе предыдущего вопроса
+        context_docs = search_in_documents(session.last_question or "", documents, k=Config.RETRIEVER_K)
+        ai_answer = generate_ai_response(question, context_docs, {
+            'waiting_for_internet_search': True,
+            'last_question': session.last_question
+        })
+        
+        # Сохраняем ответ ассистента
+        db.add(Message(session_id=user_id, role="assistant", content=ai_answer, timestamp=datetime.utcnow()))
+        db.commit()
+        
+        return ai_answer
+
+    # Проверяем, ждем ли мы уточнения
+    if session.waiting_for_clarification:
+        session.waiting_for_clarification = None
+        db.commit()
+        
+        # Сохраняем уточняющий ответ пользователя
+        db.add(Message(session_id=user_id, role="user", content=question, timestamp=datetime.utcnow()))
+        db.commit()
+        
+        # Объединяем с предыдущим вопросом
+        full_question = f"{session.last_question} {question}"
+        context_docs = search_in_documents(full_question, documents, k=Config.RETRIEVER_K)
+        ai_answer = generate_ai_response(full_question, context_docs, {
+            'waiting_for_clarification': True
+        })
+        
+        # Сохраняем ответ ассистента
+        db.add(Message(session_id=user_id, role="assistant", content=ai_answer, timestamp=datetime.utcnow()))
+        db.commit()
+        
+        # Предлагаем поиск в интернете, если ответ неполный
+        if len(context_docs) < 2:
+            session.waiting_for_internet_search = True
+            session.last_question = full_question
+            db.commit()
+            ai_answer += "\n\n🤔 Хотите, чтобы я поискал дополнительную информацию в интернете?"
+            
+        return ai_answer
+
+    # Обычная обработка нового вопроса
+    session.last_question = question
+    db.commit()
+
     # Сохраняем вопрос пользователя
     db.add(Message(session_id=user_id, role="user", content=question, timestamp=datetime.utcnow()))
     db.commit()
@@ -357,8 +520,24 @@ def handle_question(db: Session, question: str, user_id: str) -> str:
     # Ищем релевантную информацию
     context_docs = search_in_documents(question, documents, k=Config.RETRIEVER_K)
 
-    # Генерируем ответ
-    ai_answer = generate_ai_response(question, context_docs)
+    # Проверяем, нуждается ли вопрос в уточнении
+    needs_clarify, clarification_msg = needs_clarification(question)
+    if needs_clarify:
+        session.waiting_for_clarification = {"original_question": question}
+        db.commit()
+        
+        # Генерируем ответ с просьбой об уточнении
+        preliminary_response = generate_preliminary_response(question, context_docs)
+        ai_answer = f"{preliminary_response}\n\n{clarification_msg}"
+    else:
+        # Генерируем обычный ответ
+        ai_answer = generate_ai_response(question, context_docs)
+        
+        # Предлагаем поиск в интернете, если ответ неполный
+        if len(context_docs) < 2 and not any(keyword in question.lower() for keyword in ['привет', 'hello', 'hi', 'начать']):
+            session.waiting_for_internet_search = True
+            db.commit()
+            ai_answer += "\n\n🤔 Хотите, чтобы я поискал дополнительную информацию в интернете?"
 
     # Сохраняем ответ ассистента
     db.add(Message(session_id=user_id, role="assistant", content=ai_answer, timestamp=datetime.utcnow()))
@@ -367,71 +546,33 @@ def handle_question(db: Session, question: str, user_id: str) -> str:
     return ai_answer
 
 def safe_init_db():
-    """Безопасная инициализация базы данных без удаления таблиц"""
+    """Безопасная инициализация базы данных"""
     try:
         inspector = inspect(engine)
         existing_tables = inspector.get_table_names()
         
-        # Создаем chat_sessions если не существует
         if 'chat_sessions' not in existing_tables:
-            with engine.connect() as conn:
-                conn.execute(text("""
-                    CREATE TABLE chat_sessions (
-                        id VARCHAR(100) PRIMARY KEY,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        last_question TEXT,
-                        user_preferences JSONB,
-                        conversation_summary TEXT,
-                        clarification_context JSONB
-                    )
-                """))
-                conn.commit()
-                logger.info("Таблица chat_sessions создана")
+            ChatSession.__table__.create(engine)
+            logger.info("Таблица chat_sessions создана")
         
-        # Создаем messages если не существует
         if 'messages' not in existing_tables:
-            with engine.connect() as conn:
-                conn.execute(text("""
-                    CREATE TABLE messages (
-                        id SERIAL PRIMARY KEY,
-                        session_id VARCHAR(100) REFERENCES chat_sessions(id) ON DELETE CASCADE,
-                        role VARCHAR(10) NOT NULL,
-                        content TEXT NOT NULL,
-                        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        embeddings JSONB
-                    )
-                """))
-                conn.commit()
-                logger.info("Таблица messages создана")
+            Message.__table__.create(engine)
+            logger.info("Таблица messages создана")
         
-        # Безопасно добавляем недостающие колонки
+        # Добавляем новые колонки если нужно
         try:
-            if 'chat_sessions' in existing_tables:
+            with engine.connect() as conn:
+                # Проверяем и добавляем новые колонки для chat_sessions
                 chat_columns = [col['name'] for col in inspector.get_columns('chat_sessions')]
                 
-                if 'user_preferences' not in chat_columns:
-                    with engine.connect() as conn:
-                        conn.execute(text("ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS user_preferences JSONB"))
-                        conn.commit()
-                        
-                if 'conversation_summary' not in chat_columns:
-                    with engine.connect() as conn:
-                        conn.execute(text("ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS conversation_summary TEXT"))
-                        conn.commit()
-                        
-                if 'clarification_context' not in chat_columns:
-                    with engine.connect() as conn:
-                        conn.execute(text("ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS clarification_context JSONB"))
-                        conn.commit()
-            
-            if 'messages' in existing_tables:
-                messages_columns = [col['name'] for col in inspector.get_columns('messages')]
-                if 'embeddings' not in messages_columns:
-                    with engine.connect() as conn:
-                        conn.execute(text("ALTER TABLE messages ADD COLUMN IF NOT EXISTS embeddings JSONB"))
-                        conn.commit()
-                        
+                if 'waiting_for_clarification' not in chat_columns:
+                    conn.execute(text("ALTER TABLE chat_sessions ADD COLUMN waiting_for_clarification JSONB"))
+                
+                if 'waiting_for_internet_search' not in chat_columns:
+                    conn.execute(text("ALTER TABLE chat_sessions ADD COLUMN waiting_for_internet_search BOOLEAN DEFAULT FALSE"))
+                
+                conn.commit()
+                
         except Exception as e:
             logger.warning(f"Ошибка при добавлении колонок: {e}")
             
