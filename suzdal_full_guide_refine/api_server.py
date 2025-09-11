@@ -393,7 +393,29 @@ def handle_question(db: Session, question: str, user_id: str) -> str:
     db.commit()
 
     return response
+    
+def check_and_create_tables():
+    from sqlalchemy import inspect
+    
+    inspector = inspect(engine)
+    existing_tables = inspector.get_table_names()
+    
+    if 'chat_sessions' not in existing_tables or 'messages' not in existing_tables:
+        logger.info("Таблицы не найдены, создаем...")
+        Base.metadata.create_all(bind=engine)
+    else:
+        # Проверяем наличие колонок
+        chat_columns = [col['name'] for col in inspector.get_columns('chat_sessions')]
+        required_columns = ['user_preferences', 'conversation_summary', 'clarification_context']
+        
+        missing_columns = [col for col in required_columns if col not in chat_columns]
+        if missing_columns:
+            logger.warning(f"Отсутствуют колонки: {missing_columns}. Пересоздаем таблицы...")
+            Base.metadata.drop_all(bind=engine)
+            Base.metadata.create_all(bind=engine)
 
+# Вызовите эту функцию после создания engine
+check_and_create_tables()
 # --- инициализация приложения ---
 
 def initialize_app():
