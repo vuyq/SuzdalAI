@@ -14,6 +14,7 @@ from langchain_core.documents import Document
 from langchain_gigachat import GigaChat, GigaChatEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.prompts import PromptTemplate
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from tenacity import retry, stop_after_attempt, wait_exponential
 from ddgs import DDGS
 from rapidfuzz import process, fuzz
@@ -285,27 +286,19 @@ def fuzzy_retrieval(question: str, docs: List[Document], limit: int = 5) -> List
             results.append(docs[idx])
     return results
 
-def cosine_similarity(vec1, vec2):
-    if not vec1 or not vec2:
-        return 0.0
-    dot_product = sum(a * b for a, b in zip(vec1, vec2))
-    norm1 = sum(a * a for a in vec1) ** 0.5
-    norm2 = sum(b * b for b in vec2) ** 0.5
-    return dot_product / (norm1 * norm2) if norm1 and norm2 else 0.0
-
-def build_gigachat_messages(db: Session, user_id: str, current_question: str) -> List[Dict[str, str]]:
-    """Формируем массив сообщений для GigaChat API"""
+def build_gigachat_messages(db: Session, user_id: str, current_question: str) -> List:
+    """Формируем массив сообщений для GigaChat в правильном формате"""
     messages = db.query(Message).filter(Message.session_id == user_id).order_by(Message.timestamp.asc()).all()
     
     chat_history = []
     for msg in messages:
-        chat_history.append({
-            "role": msg.role,
-            "content": msg.content
-        })
+        if msg.role == "user":
+            chat_history.append(HumanMessage(content=msg.content))
+        elif msg.role == "assistant":
+            chat_history.append(AIMessage(content=msg.content))
     
     # Добавляем текущий вопрос
-    chat_history.append({"role": "user", "content": current_question})
+    chat_history.append(HumanMessage(content=current_question))
     
     return chat_history
 
@@ -324,10 +317,8 @@ TOURISM_PROMPT_TEMPLATE = """
 [Веб-результаты]:
 {web_search}
 
-[Текущий вопрос]:
-{question}
-
 Отвечай на русском языке. Будь полезным, дружелюбным и информативным гидом.
+Отвечай на вопрос: {question}
 """
 tourism_prompt = PromptTemplate.from_template(TOURISM_PROMPT_TEMPLATE)
 
@@ -338,8 +329,6 @@ def generate_ai_response(db: Session, user_id: str, question: str,
         if not token_manager.is_token_valid():
             refresh_models()
 
-        messages = build_gigachat_messages(db, user_id, question)
-
         # Форматируем контекст из документов
         context_text = ""
         if context_docs:
@@ -349,8 +338,8 @@ def generate_ai_response(db: Session, user_id: str, question: str,
                 description = doc.page_content[:300] + "..." if len(doc.page_content) > 300 else doc.page_content
                 context_text += f"{i}. {name}\n   Адрес: {address}\n   Описание: {description}\n\n"
 
-        # Системный промпт
-        system_prompt = tourism_prompt.format(
+        # Создаем системный промпт
+        system_prompt_text = tourism_prompt.format(
             question=question,
             context=context_text if context_text else "Нет релевантных данных в локальной базе о достопримечательностях Суздаля.",
             web_search=web_results if web_results else "Актуальные результаты веб-поиска не требуются для этого запроса или недоступны.",
@@ -358,9 +347,18 @@ def generate_ai_response(db: Session, user_id: str, question: str,
             user_preferences=json.dumps(user_preferences, ensure_ascii=False, indent=2) if user_preferences else "Предпочтения пользователя не указаны"
         )
 
-        messages.insert(0, {"role": "system", "content": system_prompt})
-
-        response = ai_assistant.invoke({"model": "GigaChat", "messages": messages})
+        # Создаем сообщения в правильном формате для GigaChat
+        system_message = SystemMessage(content=system_prompt_text)
+        user_message = HumanMessage(content=question)
+        
+        # Получаем историю чата
+        chat_history = build_gigachat_messages(db, user_id, question)
+        
+        # Формируем финальный список сообщений: системный промпт + история + текущий вопрос
+        all_messages = [system_message] + chat_history
+        
+        # Вызываем модель с правильным форматом ввода
+        response = ai_assistant.invoke(all_messages)
         response_text = response.content if hasattr(response, "content") else str(response)
         return response_text
 
