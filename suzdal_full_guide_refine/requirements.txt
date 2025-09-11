@@ -14,3 +14,4 @@ rapidfuzz
 duckduckgo-search
 sqlalchemy
 psycopg2-binary
+alembic
