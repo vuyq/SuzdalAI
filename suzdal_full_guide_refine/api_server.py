@@ -293,8 +293,6 @@ def cosine_similarity(vec1, vec2):
     norm2 = sum(b * b for b in vec2) ** 0.5
     return dot_product / (norm1 * norm2) if norm1 and norm2 else 0.0
 
-# --- новые функции ---
-
 def build_gigachat_messages(db: Session, user_id: str, current_question: str) -> List[Dict[str, str]]:
     """Формируем массив сообщений для GigaChat API"""
     messages = db.query(Message).filter(Message.session_id == user_id).order_by(Message.timestamp.asc()).all()
@@ -329,7 +327,7 @@ TOURISM_PROMPT_TEMPLATE = """
 [Текущий вопрос]:
 {question}
 
-Отвечай на русском языке.
+Отвечай на русском языке. Будь полезным, дружелюбным и информативным гидом.
 """
 tourism_prompt = PromptTemplate.from_template(TOURISM_PROMPT_TEMPLATE)
 
@@ -342,13 +340,22 @@ def generate_ai_response(db: Session, user_id: str, question: str,
 
         messages = build_gigachat_messages(db, user_id, question)
 
+        # Форматируем контекст из документов
+        context_text = ""
+        if context_docs:
+            for i, doc in enumerate(context_docs, 1):
+                name = doc.metadata.get('name', 'Неизвестно')
+                address = doc.metadata.get('address', 'Адрес не указан')
+                description = doc.page_content[:300] + "..." if len(doc.page_content) > 300 else doc.page_content
+                context_text += f"{i}. {name}\n   Адрес: {address}\n   Описание: {description}\n\n"
+
         # Системный промпт
         system_prompt = tourism_prompt.format(
             question=question,
-            context="\n\n".join(d.page_content for d in context_docs) if context_docs else "Нет данных в базе",
-        web_search=web_results or "Нет результатов",
-            conversation_summary=conversation_summary or "Нет истории",
-            user_preferences=json.dumps(user_preferences, ensure_ascii=False, indent=2)
+            context=context_text if context_text else "Нет релевантных данных в локальной базе о достопримечательностях Суздаля.",
+            web_search=web_results if web_results else "Актуальные результаты веб-поиска не требуются для этого запроса или недоступны.",
+            conversation_summary=conversation_summary or "Нет истории диалога",
+            user_preferences=json.dumps(user_preferences, ensure_ascii=False, indent=2) if user_preferences else "Предпочтения пользователя не указаны"
         )
 
         messages.insert(0, {"role": "system", "content": system_prompt})
@@ -359,9 +366,7 @@ def generate_ai_response(db: Session, user_id: str, question: str,
 
     except Exception as e:
         logger.error(f"Ошибка генерации ответа: {e}")
-        return "Извините, произошла ошибка при генерации ответа."
-
-# --- основные обработчики остаются, но handle_question обновим ---
+        return "Извините, произошла ошибка при генерации ответа. Пожалуйста, попробуйте задать вопрос еще раз."
 
 def handle_question(db: Session, question: str, user_id: str) -> str:
     if not app_initialized:
@@ -371,30 +376,53 @@ def handle_question(db: Session, question: str, user_id: str) -> str:
     if not question:
         return "Пожалуйста, задайте ваш вопрос о Суздале."
 
+    # Получаем или создаем сессию
     session = db.query(ChatSession).filter(ChatSession.id == user_id).first()
+    if not session:
+        session = ChatSession(id=user_id, user_preferences={}, conversation_summary="")
+        db.add(session)
+        db.commit()
 
-    # сохраняем вопрос пользователя
-    from datetime import datetime
-    db.add(Message(session_id=user_id, role="user", content=question, timestamp=datetime.utcnow()))
-    db.commit()
+    # Сохраняем вопрос пользователя
+    user_message = Message(session_id=user_id, role="user", content=question, timestamp=datetime.utcnow())
+    db.add(user_message)
 
-    user_preferences = session.user_preferences if session and session.user_preferences else {}
-    conversation_summary = session.conversation_summary if session else ""
+    user_preferences = session.user_preferences if session.user_preferences else {}
+    conversation_summary = session.conversation_summary if session.conversation_summary else ""
 
+    # 1. Сначала ищем в векторной базе
     context_docs = search_in_vector_store(question)
+    
+    # 2. Если в локальной базе ничего не найдено, используем фаззи-поиск
     if not context_docs and documents:
         context_docs = fuzzy_retrieval(question, documents, limit=Config.RETRIEVER_K)
+    
+    web_results = ""
+    # 3. Определяем, нужен ли веб-поиск
+    requires_web_search = (
+        not context_docs or 
+        any(keyword in question.lower() for keyword in 
+            ['новости', 'события', 'мероприятия', 'отзыв', 'акция', 'погода', 'цена', 'стоимость', 'билет', 'расписание'])
+    )
+    
+    if requires_web_search:
+        web_results = perform_web_search(question)
+        logger.info(f"Выполнен веб-поиск по запросу: {question}")
 
-    ai_answer = generate_ai_response(db, user_id, question, context_docs, "", conversation_summary, user_preferences)
+    # 4. Генерируем ответ
+    ai_answer = generate_ai_response(db, user_id, question, context_docs, web_results, conversation_summary, user_preferences)
 
-    response = ai_answer
-
-    db.add(Message(session_id=user_id, role="assistant", content=response, timestamp=datetime.utcnow()))
+    # Сохраняем ответ ассистента
+    assistant_message = Message(session_id=user_id, role="assistant", content=ai_answer, timestamp=datetime.utcnow())
+    db.add(assistant_message)
+    
+    # Обновляем последний вопрос в сессии
+    session.last_question = question
+    session.updated_at = datetime.utcnow()
+    
     db.commit()
 
-    return response
-
-# --- инициализация приложения ---
+    return ai_answer
 
 def initialize_app():
     global embedding_model, ai_assistant, documents, vector_store, document_retriever, app_initialized, token_manager
@@ -406,7 +434,9 @@ def initialize_app():
         documents = load_data()
         
         if documents:
-            vector_store = FAISS.from_documents(documents, embedding_model)
+            texts = [doc.page_content for doc in documents]
+            metadatas = [doc.metadata for doc in documents]
+            vector_store = FAISS.from_texts(texts, embedding_model, metadatas=metadatas)
             document_retriever = vector_store.as_retriever(search_kwargs={"k": Config.RETRIEVER_K})
             logger.info(f"Приложение успешно инициализировано, загружено {len(documents)} документов")
         else:
@@ -420,6 +450,7 @@ def initialize_app():
         app_initialized = False
         raise
 
+# Инициализация приложения
 initialize_app()
 
 app = FastAPI(title="Суздаль Tourism Assistant")
@@ -454,7 +485,7 @@ async def health_check():
     return {
         "status": status, 
         "initialized": app_initialized,
-    "timestamp": datetime.utcnow(),
+        "timestamp": datetime.utcnow(),
         "documents_loaded": len(documents),
         "token_valid": token_manager.is_token_valid() if token_manager else False
     }
