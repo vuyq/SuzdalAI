@@ -15,6 +15,7 @@ from langchain_core.documents import Document
 from langchain_gigachat import GigaChat, GigaChatEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.prompts import PromptTemplate
+from langchain_core.messages import HumanMessage, SystemMessage
 from tenacity import retry, stop_after_attempt, wait_exponential
 from ddgs import DDGS
 from rapidfuzz import process, fuzz
@@ -296,6 +297,18 @@ def create_fallback_data() -> List[Document]:
             'type': 'отель',
             'address': 'ул. Коровники, д. 45',
             'description': 'Комфортабельный отель с бассейном и спа'
+        },
+        {
+            'name': 'Кафе Улей',
+            'type': 'кафе',
+            'address': 'ул. Васильевская, д. 27',
+            'description': 'Уютное кафе с домашней кухней и выпечкой'
+        },
+        {
+            'name': 'Трапезная палата',
+            'type': 'ресторан',
+            'address': 'ул. Кремлевская, д. 10',
+            'description': 'Ресторан в историческом здании с русской кухней'
         }
     ]
     
@@ -394,19 +407,14 @@ def generate_ai_response(db: Session, user_id: str, question: str,
             context=context_text or "Нет данных в базе",
         )
 
-        # Создаем сообщения для API
+        # Исправленный вызов модели - используем правильный формат
         messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": question}
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=question)
         ]
 
-        # Вызываем модель
-        response = ai_assistant.invoke({
-            "model": "GigaChat", 
-            "messages": messages,
-            "temperature": 0.2,
-            "max_tokens": 500
-        })
+        # Правильный вызов модели
+        response = ai_assistant.invoke(messages)
         
         response_text = response.content if hasattr(response, "content") else str(response)
         return response_text
@@ -426,17 +434,19 @@ def generate_fallback_response(question: str, context_docs: List[Document]) -> s
                       ['ресторан', 'кафе', 'столовая', 'еда', 'питание', 'food']]
         
         if restaurants:
-            response = "В Суздале есть несколько мест где можно поесть:\n\n"
+            response = "🍽️ **Где поесть в Суздале:**\n\n"
             for i, rest in enumerate(restaurants[:5], 1):
-                response += f"{i}. {rest.metadata.get('name', 'Заведение')}\n"
+                response += f"**{i}. {rest.metadata.get('name', 'Заведение')}**\n"
                 if 'address' in rest.metadata:
-                    response += f"   Адрес: {rest.metadata['address']}\n"
+                    response += f"   📍 Адрес: {rest.metadata['address']}\n"
                 if 'hours' in rest.metadata:
-                    response += f"   Часы работы: {rest.metadata['hours']}\n"
+                    response += f"   🕒 Часы работы: {rest.metadata['hours']}\n"
+                if 'description' in rest.metadata:
+                    response += f"   📝 {rest.metadata['description'][:100]}...\n"
                 response += "\n"
-            return response + "\nРекомендую уточнить у местных жителей о текущем режиме работы."
+            return response + "\nРекомендую уточнить актуальный режим работы у администрации заведений."
         else:
-            return "В Суздале есть множество кафе и ресторанов с традиционной русской кухней. Рекомендую посетить рестораны в центре города или спросить у местных жителей о лучших местах."
+            return "🍽️ В Суздале есть множество кафе и ресторанов с традиционной русской кухней. Популярные места:\n\n• **Рестораны в центре города** - предлагают блюда русской кухни\n• **Кафе на улице Ленина** - уютные места с домашней атмосферой\n• **Трапезные при монастырях** - аутентичная атмосфера\n\nРекомендую прогуляться по центру города - там вы найдете множество вариантов!"
 
     # Ответы про достопримечательности
     elif any(keyword in question_lower for keyword in ['достопримечательность', 'что посмотреть', 'куда сходить', 'музей', 'кремль']):
@@ -444,18 +454,38 @@ def generate_fallback_response(question: str, context_docs: List[Document]) -> s
                       ['достопримечательность', 'музей', 'памятник', 'attraction']]
         
         if attractions:
-            response = "Основные достопримечательности Суздаля:\n\n"
+            response = "🏛️ **Достопримечательности Суздаля:**\n\n"
             for i, attr in enumerate(attractions[:5], 1):
-                response += f"{i}. {attr.metadata.get('name', 'Достопримечательность')}\n"
+                response += f"**{i}. {attr.metadata.get('name', 'Достопримечательность')}**\n"
                 if 'description' in attr.metadata:
-                    response += f"   {attr.metadata['description'][:100]}...\n"
+                    response += f"   📝 {attr.metadata['description'][:100]}...\n"
+                if 'address' in attr.metadata:
+                    response += f"   📍 Адрес: {attr.metadata['address']}\n"
                 response += "\n"
             return response
         else:
-            return "Суздаль богат достопримечательностями: Суздальский кремль, Музей деревянного зодчества, многочисленные церкви и монастыри. Обязательно посетите исторический центр города."
+            return "🏛️ Суздаль богат достопримечательностями! Обязательно посетите:\n\n• **Суздальский кремль** - исторический центр города\n• **Музей деревянного зодчества** - уникальные памятники архитектуры\n• **Покровский монастырь** - древняя обитель с богатой историей\n• **Торговые ряды** - архитектурный памятник XIX века\n• **Многочисленные церкви и храмы** - более 30 культовых сооружений"
+
+    # Ответы про жилье
+    elif any(keyword in question_lower for keyword in ['отель', 'гостиница', 'жилье', 'где остановиться', 'ночлег']):
+        hotels = [doc for doc in context_docs if doc.metadata.get('type', '').lower() in 
+                 ['отель', 'гостиница', 'hotel', 'гостевой дом']]
+        
+        if hotels:
+            response = "🏨 **Где остановиться в Суздале:**\n\n"
+            for i, hotel in enumerate(hotels[:5], 1):
+                response += f"**{i}. {hotel.metadata.get('name', 'Отель')}**\n"
+                if 'address' in hotel.metadata:
+                    response += f"   📍 Адрес: {hotel.metadata['address']}\n"
+                if 'description' in hotel.metadata:
+                    response += f"   📝 {hotel.metadata['description'][:100]}...\n"
+                response += "\n"
+            return response
+        else:
+            return "🏨 В Суздале есть различные варианты размещения:\n\n• **Гостиницы в центре города** - удобное расположение\n• **Гостевые дома** - уютная атмосфера\n• **Загородные отели** - тишина и природа\n• **Гостиницы при монастырях** - уникальный опыт\n\nРекомендую бронировать заранее, особенно в туристический сезон."
 
     # Общий ответ
-    return "Извините, в данный момент я не могу обработать ваш запрос. Суздаль - прекрасный город с богатой историей, множеством достопримечательностей и уютных мест. Рекомендую обратиться в местный туристический центр за подробной информацией."
+    return "Привет! Я виртуальный гид по Суздалю. 🏛️\n\nЧем могу помочь?\n• Подсказать где поесть 🍽️\n• Посоветовать достопримечательности 🏛️\n• Помочь с выбором жилья 🏨\n• Рассказать об истории города 📖\n\nЗадайте ваш вопрос, и я постараюсь помочь!"
 
 def handle_question(db: Session, question: str, user_id: str) -> str:
     if not app_initialized:
