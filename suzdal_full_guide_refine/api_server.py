@@ -44,7 +44,7 @@ Base = declarative_base()
 
 # Модели базы данных
 class ChatSession(Base):
-    tablename = "chat_sessions"
+    __tablename__ = "chat_sessions"
     id = Column(String(100), primary_key=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -55,7 +55,7 @@ class ChatSession(Base):
     messages = relationship("Message", back_populates="session", cascade="all, delete-orphan")
 
 class Message(Base):
-    tablename = "messages"
+    __tablename__ = "messages"
     id = Column(Integer, primary_key=True, autoincrement=True)
     session_id = Column(String(100), ForeignKey("chat_sessions.id"), nullable=False)
     role = Column(String(10), nullable=False)
