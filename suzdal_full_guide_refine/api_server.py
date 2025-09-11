@@ -80,7 +80,7 @@ class Config:
     MAX_RETRIES = 3
     REQUEST_TIMEOUT = 15
     SEARCH_RESULTS = 3
-    RETRIEVER_K = 5
+    RETRIEVER_K = 2  # Показываем только 2 места
     CERT_PATH = os.getenv("CERT_PATH", "./cert.pem")
     CERT_URL = os.getenv("CERT_URL")
     GIGACHAT_AUTH = os.getenv("GIGACHAT_AUTH")
@@ -91,14 +91,14 @@ class Config:
     TOKEN_EXPIRY_MINUTES = 25
     MEMORY_CONTEXT_SIZE = 10
     PREFERENCES_UPDATE_INTERVAL = 5
-    SEMANTIC_SEARCH_K = 3
+    SEMANTIC_SEARCH_K = 2
 
 # Глобальные переменные
 embedding_model = None
 ai_assistant = None
 documents = []
 vector_store = None
-document_retriever = None
+document_retriever = null
 app_initialized = False
 token_manager = None
 
@@ -245,20 +245,8 @@ def load_data() -> List[Document]:
         documents.append(doc)
     return documents
 
-@lru_cache(maxsize=100)
-def perform_web_search(query: str) -> str:
-    try:
-        results = []
-        with DDGS() as ddgs:
-            for r in ddgs.text(f"{query} Суздаль", max_results=Config.SEARCH_RESULTS, timelimit='y'):
-                results.append(f"• {r['title']}\n  {r['href']}\n  {r['body'][:200]}...")
-        return "\n\n".join(results) if results else "Не найдено результатов"
-    except Exception as e:
-        logger.error(f"Ошибка веб-поиска: {e}")
-        return "Ошибка при выполнении поиска"
-
 def search_in_vector_store(query: str, k: int = None) -> List[Document]:
-    if not vector_store or not document_retriever:
+    if not vector_store:
         return []
     
     try:
@@ -303,39 +291,38 @@ def build_gigachat_messages(db: Session, user_id: str, current_question: str) ->
     return chat_history
 
 TOURISM_PROMPT_TEMPLATE = """
-Ты виртуальный гид по Суздалю. Всегда предлагай пользователю поискать дополнительную информацию в интернете, даже если нашел что-то в локальной базе.
+Ты виртуальный гид по Суздалю. Всегда предлагай пользователю поискать дополнительную информацию в интернете.
 
 [Информация из локальной базы]:
 {context}
-
-[Веб-результаты]:
-{web_search}
 
 [Предпочтения пользователя]:
 {user_preferences}
 
 Отвечай на русском языке. Будь полезным, дружелюбным и информативным гидом.
+Покажи только 2 наиболее подходящих места из базы.
+Если информации недостаточно, извинись и вежливо предложи поискать в интернете.
 Всегда в конце ответа предложи поискать более актуальную информацию в интернете.
 
-Отвечай на вопрос: {question}
+Вопрос пользователя: {question}
 """
 
 tourism_prompt = PromptTemplate.from_template(TOURISM_PROMPT_TEMPLATE)
 
 def generate_ai_response(db: Session, user_id: str, question: str, 
-                         context_docs: List[Document], web_results: str,
+                         context_docs: List[Document],
                          conversation_summary: str, user_preferences: Dict) -> str:
     try:
         if not token_manager.is_token_valid():
             refresh_models()
 
-        # Форматируем контекст из документов
+        # Форматируем контекст из документов (максимум 2 места)
         context_text = ""
         if context_docs:
-            for i, doc in enumerate(context_docs, 1):
+            for i, doc in enumerate(context_docs[:2], 1):  # Берем только первые 2 документа
                 name = doc.metadata.get('name', 'Неизвестно')
                 address = doc.metadata.get('address', 'Адрес не указан')
-                description = doc.page_content[:300] + "..." if len(doc.page_content) > 300 else doc.page_content
+                description = doc.page_content[:200] + "..." if len(doc.page_content) > 200 else doc.page_content
                 context_text += f"{i}. {name}\n   Адрес: {address}\n   Описание: {description}\n\n"
         else:
             context_text = "К сожалению, в моей локальной базе нет информации по вашему запросу."
@@ -344,7 +331,6 @@ def generate_ai_response(db: Session, user_id: str, question: str,
         system_prompt_text = tourism_prompt.format(
             question=question,
             context=context_text,
-            web_search=web_results if web_results else "Я могу поискать актуальную информацию в интернете для вас.",
             user_preferences=json.dumps(user_preferences, ensure_ascii=False, indent=2) if user_preferences else "Предпочтения пользователя не указаны"
         )
 
@@ -388,20 +374,15 @@ def handle_question(db: Session, question: str, user_id: str) -> str:
     user_preferences = session.user_preferences if session.user_preferences else {}
     conversation_summary = session.conversation_summary if session.conversation_summary else ""
 
-    # 1. Сначала ищем в векторной базе
-    context_docs = search_in_vector_store(question)
+    # 1. Сначала ищем в векторной базе (максимум 2 результата)
+    context_docs = search_in_vector_store(question, k=2)
     
-    # 2. Если в локальной базе ничего не найдено, используем фаззи-поиск
+    # 2. Если в локальной базе ничего не найдено, используем фаззи-поиск (максимум 2 результата)
     if not context_docs and documents:
-        context_docs = fuzzy_retrieval(question, documents, limit=Config.RETRIEVER_K)
-    
-    web_results = ""
-    # 3. Всегда выполняем веб-поиск для актуальной информации
-    web_results = perform_web_search(question)
-    logger.info(f"Выполнен веб-поиск по запросу: {question}")
+        context_docs = fuzzy_retrieval(question, documents, limit=2)
 
-    # 4. Генерируем ответ
-    ai_answer = generate_ai_response(db, user_id, question, context_docs, web_results, conversation_summary, user_preferences)
+    # 3. Генерируем ответ БЕЗ веб-поиска, только предложение поискать в интернете
+    ai_answer = generate_ai_response(db, user_id, question, context_docs, conversation_summary, user_preferences)
 
     # Сохраняем ответ ассистента
     assistant_message = Message(session_id=user_id, role="assistant", content=ai_answer, timestamp=datetime.utcnow())
@@ -428,7 +409,6 @@ def initialize_app():
             texts = [doc.page_content for doc in documents]
             metadatas = [doc.metadata for doc in documents]
             vector_store = FAISS.from_texts(texts, embedding_model, metadatas=metadatas)
-            document_retriever = vector_store.as_retriever(search_kwargs={"k": Config.RETRIEVER_K})
             logger.info(f"Приложение успешно инициализировано, загружено {len(documents)} документов")
         else:
             logger.warning("Документы не загружены, RAG будет работать в ограниченном режиме")
