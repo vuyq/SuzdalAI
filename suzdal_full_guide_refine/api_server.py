@@ -64,9 +64,6 @@ class Message(Base):
     embeddings = Column(JSON, nullable=True)
     session = relationship("ChatSession", back_populates="messages")
 
-# Создание таблиц
-Base.metadata.create_all(bind=engine)
-
 # Dependency
 def get_db():
     db = SessionLocal()
@@ -293,8 +290,6 @@ def cosine_similarity(vec1, vec2):
     norm2 = sum(b * b for b in vec2) ** 0.5
     return dot_product / (norm1 * norm2) if norm1 and norm2 else 0.0
 
-# --- новые функции ---
-
 def build_gigachat_messages(db: Session, user_id: str, current_question: str) -> List[Dict[str, str]]:
     """Формируем массив сообщений для GigaChat API"""
     messages = db.query(Message).filter(Message.session_id == user_id).order_by(Message.timestamp.asc()).all()
@@ -361,8 +356,6 @@ def generate_ai_response(db: Session, user_id: str, question: str,
         logger.error(f"Ошибка генерации ответа: {e}")
         return "Извините, произошла ошибка при генерации ответа."
 
-# --- основные обработчики остаются, но handle_question обновим ---
-
 def handle_question(db: Session, question: str, user_id: str) -> str:
     if not app_initialized:
         return "Приложение еще не инициализировано. Попробуйте позже."
@@ -374,7 +367,6 @@ def handle_question(db: Session, question: str, user_id: str) -> str:
     session = db.query(ChatSession).filter(ChatSession.id == user_id).first()
 
     # сохраняем вопрос пользователя
-    from datetime import datetime
     db.add(Message(session_id=user_id, role="user", content=question, timestamp=datetime.utcnow()))
     db.commit()
 
@@ -393,30 +385,92 @@ def handle_question(db: Session, question: str, user_id: str) -> str:
     db.commit()
 
     return response
-    
-def check_and_create_tables():
-    from sqlalchemy import inspect
-    
-    inspector = inspect(engine)
-    existing_tables = inspector.get_table_names()
-    
-    if 'chat_sessions' not in existing_tables or 'messages' not in existing_tables:
-        logger.info("Таблицы не найдены, создаем...")
-        Base.metadata.create_all(bind=engine)
-    else:
-        # Проверяем наличие колонок
-        chat_columns = [col['name'] for col in inspector.get_columns('chat_sessions')]
-        required_columns = ['user_preferences', 'conversation_summary', 'clarification_context']
-        
-        missing_columns = [col for col in required_columns if col not in chat_columns]
-        if missing_columns:
-            logger.warning(f"Отсутствуют колонки: {missing_columns}. Пересоздаем таблицы...")
-            Base.metadata.drop_all(bind=engine)
-            Base.metadata.create_all(bind=engine)
 
-# Вызовите эту функцию после создания engine
-check_and_create_tables()
-# --- инициализация приложения ---
+def safe_init_db():
+    """Безопасная инициализация базы данных без удаления таблиц"""
+    from sqlalchemy import inspect, text
+    
+    try:
+        inspector = inspect(engine)
+        
+        # Проверяем существование таблиц
+        existing_tables = inspector.get_table_names()
+        
+        # Создаем chat_sessions если не существует
+        if 'chat_sessions' not in existing_tables:
+            with engine.connect() as conn:
+                conn.execute(text("""
+                    CREATE TABLE chat_sessions (
+                        id VARCHAR(100) PRIMARY KEY,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        last_question TEXT,
+                        user_preferences JSONB,
+                        conversation_summary TEXT,
+                        clarification_context JSONB
+                    )
+                """))
+                conn.commit()
+                logger.info("Таблица chat_sessions создана")
+        
+        # Создаем messages если не существует
+        if 'messages' not in existing_tables:
+            with engine.connect() as conn:
+                conn.execute(text("""
+                    CREATE TABLE messages (
+                        id SERIAL PRIMARY KEY,
+                        session_id VARCHAR(100) REFERENCES chat_sessions(id) ON DELETE CASCADE,
+                        role VARCHAR(10) NOT NULL,
+                        content TEXT NOT NULL,
+                        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        embeddings JSONB
+                    )
+                """))
+                conn.commit()
+                logger.info("Таблица messages создана")
+        
+        # БЕЗОПАСНО добавляем недостающие колонки
+        try:
+            if 'chat_sessions' in existing_tables:
+                chat_columns = [col['name'] for col in inspector.get_columns('chat_sessions')]
+                
+                # Добавляем только отсутствующие колонки
+                if 'user_preferences' not in chat_columns:
+                    with engine.connect() as conn:
+                        conn.execute(text("ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS user_preferences JSONB"))
+                        conn.commit()
+                        logger.info("Добавлена колонка user_preferences")
+                        
+                if 'conversation_summary' not in chat_columns:
+                    with engine.connect() as conn:
+                        conn.execute(text("ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS conversation_summary TEXT"))
+                        conn.commit()
+                        logger.info("Добавлена колонка conversation_summary")
+                        
+                if 'clarification_context' not in chat_columns:
+                    with engine.connect() as conn:
+                        conn.execute(text("ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS clarification_context JSONB"))
+                        conn.commit()
+                        logger.info("Добавлена колонка clarification_context")
+            
+            if 'messages' in existing_tables:
+                messages_columns = [col['name'] for col in inspector.get_columns('messages')]
+                if 'embeddings' not in messages_columns:
+                    with engine.connect() as conn:
+                        conn.execute(text("ALTER TABLE messages ADD COLUMN IF NOT EXISTS embeddings JSONB"))
+                        conn.commit()
+                        logger.info("Добавлена колонка embeddings")
+                        
+        except Exception as e:
+            logger.warning(f"Ошибка при добавлении колонок: {e}")
+            # Продолжаем работу даже если есть ошибки
+            
+    except Exception as e:
+        logger.error(f"Ошибка инициализации базы: {e}")
+        # Не падаем, пытаемся работать дальше
+
+# Инициализация базы данных
+safe_init_db()
 
 def initialize_app():
     global embedding_model, ai_assistant, documents, vector_store, document_retriever, app_initialized, token_manager
@@ -476,7 +530,7 @@ async def health_check():
     return {
         "status": status, 
         "initialized": app_initialized,
-    "timestamp": datetime.utcnow(),
+        "timestamp": datetime.utcnow(),
         "documents_loaded": len(documents),
         "token_valid": token_manager.is_token_valid() if token_manager else False
     }
