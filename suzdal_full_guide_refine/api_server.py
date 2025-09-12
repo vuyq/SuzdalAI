@@ -80,7 +80,7 @@ class Config:
     MAX_RETRIES = 3
     REQUEST_TIMEOUT = 15
     SEARCH_RESULTS = 3
-    RETRIEVER_K = 2  # Показываем только 2 места
+    MAX_PLACES_TO_SHOW = 2  # Максимальное количество мест для показа
     CERT_PATH = os.getenv("CERT_PATH", "./cert.pem")
     CERT_URL = os.getenv("CERT_URL")
     GIGACHAT_AUTH = os.getenv("GIGACHAT_AUTH")
@@ -91,14 +91,12 @@ class Config:
     TOKEN_EXPIRY_MINUTES = 25
     MEMORY_CONTEXT_SIZE = 10
     PREFERENCES_UPDATE_INTERVAL = 5
-    SEMANTIC_SEARCH_K = 2
 
 # Глобальные переменные
 embedding_model = None
 ai_assistant = None
 documents = []
 vector_store = None
-document_retriever = None  # Исправлено: null -> None
 app_initialized = False
 token_manager = None
 
@@ -245,19 +243,18 @@ def load_data() -> List[Document]:
         documents.append(doc)
     return documents
 
-def search_in_vector_store(query: str, k: int = None) -> List[Document]:
+def search_in_vector_store(query: str, k: int = Config.MAX_PLACES_TO_SHOW) -> List[Document]:
     if not vector_store:
         return []
     
     try:
-        k = k or Config.RETRIEVER_K
         results = vector_store.similarity_search(query, k=k)
-        return results
+        return results[:Config.MAX_PLACES_TO_SHOW]  # Явно ограничиваем количество
     except Exception as e:
         logger.error(f"Ошибка поиска в векторной базе: {e}")
         return []
 
-def fuzzy_retrieval(question: str, docs: List[Document], limit: int = 5) -> List[Document]:
+def fuzzy_retrieval(question: str, docs: List[Document], limit: int = Config.MAX_PLACES_TO_SHOW) -> List[Document]:
     if not docs:
         return []
     
@@ -272,7 +269,7 @@ def fuzzy_retrieval(question: str, docs: List[Document], limit: int = 5) -> List
     for match_text, score, idx in matches:
         if score > 50:
             results.append(docs[idx])
-    return results
+    return results[:Config.MAX_PLACES_TO_SHOW]  # Явно ограничиваем количество
 
 def build_gigachat_messages(db: Session, user_id: str, current_question: str) -> List:
     """Формируем массив сообщений для GigaChat в правильном формате"""
@@ -291,18 +288,16 @@ def build_gigachat_messages(db: Session, user_id: str, current_question: str) ->
     return chat_history
 
 TOURISM_PROMPT_TEMPLATE = """
-Ты виртуальный гид по Суздалю. Всегда предлагай пользователю поискать дополнительную информацию в интернете.
+Ты виртуальный гид по Суздалю. Ты должен показать только 2 наиболее релевантных места.
 
-[Информация из локальной базы]:
+Покажи ровно 2 места из базы данных. Не больше!
+
+Информация из базы:
 {context}
 
-[Предпочтения пользователя]:
-{user_preferences}
-
 Отвечай на русском языке. Будь полезным, дружелюбным и информативным гидом.
-Покажи только 2 наиболее подходящих места из базы.
 Если информации недостаточно, извинись и вежливо предложи поискать в интернете.
-Всегда в конце ответа предложи поискать более актуальную информацию в интернете.
+В конце ответа обязательно предложи поискать более актуальную информацию в интернете.
 
 Вопрос пользователя: {question}
 """
@@ -318,11 +313,13 @@ def generate_ai_response(db: Session, user_id: str, question: str,
 
         # Форматируем контекст из документов (максимум 2 места)
         context_text = ""
-        if context_docs:
-            for i, doc in enumerate(context_docs[:2], 1):  # Берем только первые 2 документа
+        limited_docs = context_docs[:Config.MAX_PLACES_TO_SHOW]  # Явно ограничиваем
+        
+        if limited_docs:
+            for i, doc in enumerate(limited_docs, 1):
                 name = doc.metadata.get('name', 'Неизвестно')
                 address = doc.metadata.get('address', 'Адрес не указан')
-                description = doc.page_content[:200] + "..." if len(doc.page_content) > 200 else doc.page_content
+                description = doc.page_content[:150] + "..." if len(doc.page_content) > 150 else doc.page_content
                 context_text += f"{i}. {name}\n   Адрес: {address}\n   Описание: {description}\n\n"
         else:
             context_text = "К сожалению, в моей локальной базе нет информации по вашему запросу."
@@ -375,13 +372,16 @@ def handle_question(db: Session, question: str, user_id: str) -> str:
     conversation_summary = session.conversation_summary if session.conversation_summary else ""
 
     # 1. Сначала ищем в векторной базе (максимум 2 результата)
-    context_docs = search_in_vector_store(question, k=2)
+    context_docs = search_in_vector_store(question)
     
     # 2. Если в локальной базе ничего не найдено, используем фаззи-поиск (максимум 2 результата)
     if not context_docs and documents:
-        context_docs = fuzzy_retrieval(question, documents, limit=2)
+        context_docs = fuzzy_retrieval(question, documents)
 
-    # 3. Генерируем ответ БЕЗ веб-поиска, только предложение поискать в интернете
+    # 3. Явно ограничиваем количество документов
+    context_docs = context_docs[:Config.MAX_PLACES_TO_SHOW]
+
+    # 4. Генерируем ответ БЕЗ веб-поиска, только предложение поискать в интернете
     ai_answer = generate_ai_response(db, user_id, question, context_docs, conversation_summary, user_preferences)
 
     # Сохраняем ответ ассистента
@@ -397,7 +397,7 @@ def handle_question(db: Session, question: str, user_id: str) -> str:
     return ai_answer
 
 def initialize_app():
-    global embedding_model, ai_assistant, documents, vector_store, document_retriever, app_initialized, token_manager
+    global embedding_model, ai_assistant, documents, vector_store, app_initialized, token_manager
     
     try:
         download_certificate()
