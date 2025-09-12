@@ -98,7 +98,7 @@ embedding_model = None
 ai_assistant = None
 documents = []
 vector_store = None
-document_retriever = null
+document_retriever = None  # Исправлено: null -> None
 app_initialized = False
 token_manager = None
 
