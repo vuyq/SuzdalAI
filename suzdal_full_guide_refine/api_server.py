@@ -267,33 +267,51 @@ def ask_clarification_questions(question: str, session: ChatSession) -> str:
                 "2. Вы путешествуете один, с семьей или друзьями?\n"
                 "3. Есть ли особые интересы или ограничения?")
 
-def generate_rag_response_with_offer(db: Session, user_id: str, question: str,
-                                   context_docs: List[Document],
-                                   conversation_summary: str, user_preferences: Dict) -> str:
+def generate_rag_response_with_offer(
+    db: Session,
+    user_id: str,
+    question: str,
+    context_docs: List[Document],
+    conversation_summary: str,
+    user_preferences: Dict
+) -> str:
     if not token_manager.is_token_valid():
         refresh_models()
+
+    # Формируем контекст
     context_text = ""
     for i, doc in enumerate(context_docs, 1):
-        name = doc.metadata.get('name', 'Неизвестно')
-        address = doc.metadata.get('address', 'Адрес не указан')
+        name = doc.metadata.get("name", "Неизвестно")
+        address = doc.metadata.get("address", "Адрес не указан")
         description = doc.page_content[:150] + "..." if len(doc.page_content) > 150 else doc.page_content
         context_text += f"{i}. {name}\n   Адрес: {address}\n   Описание: {description}\n\n"
+
+    # Системный промпт
     system_prompt = f"""
 Ты виртуальный гид по Суздалю. Отвечай на основе базы данных.
 
 Информация из базы:
 {context_text}
 
-Отвечай на русском языке. Будь дружелюбным гидом.
-В конце добавь: "Хотите, чтобы я поискал более свежую информацию в интернете?"
-
+Отвечай на русском языке. Будь дружелюбным и информативным гидом.
+В конце ответа добавь предложение поиска в интернете.
 Вопрос пользователя: {question}
 """
+
     system_message = SystemMessage(content=system_prompt)
     chat_history = build_gigachat_messages(db, user_id, question)
     all_messages = [system_message] + chat_history
+
     response = ai_assistant.invoke(all_messages)
-    return response.content if hasattr(response, "content") else str(response)
+    response_text = response.content if hasattr(response, "content") else str(response)
+
+    # ✅ Жёстко добавляем, если модель забыла
+    offer_text = "Хотите, чтобы я поискал более свежую информацию в интернете?"
+    if offer_text.lower() not in response_text.lower():
+        response_text = response_text.strip() + "\n\n" + offer_text
+
+    return response_text
+
 
 def search_web(query: str) -> List[Dict]:
     try:
