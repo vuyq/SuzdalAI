@@ -1,3 +1,5 @@
+замени модель на GigaChat Max
+
 import os
 import requests
 import pandas as pd
@@ -171,7 +173,7 @@ def initialize_models() -> Tuple[GigaChatEmbeddings, GigaChat]:
             timeout=Config.REQUEST_TIMEOUT
         )
         ai_assistant = GigaChat(
-            access_token=access_token, model="GigaChat Max", temperature=0.2,
+            access_token=access_token, model="GigaChat", temperature=0.2,
             verify_ssl_certs=bool(Config.CERT_PATH),
             ca_bundle_file=Config.CERT_PATH if Path(Config.CERT_PATH).exists() else None,
             timeout=Config.REQUEST_TIMEOUT, verbose=True
@@ -180,6 +182,7 @@ def initialize_models() -> Tuple[GigaChatEmbeddings, GigaChat]:
     except Exception as e:
         logger.error(f"Ошибка инициализации моделей: {e}")
         raise
+
 def refresh_models():
     global embedding_model, ai_assistant
     try:
@@ -192,7 +195,7 @@ def refresh_models():
             ai_assistant.access_token = access_token
         else:
             ai_assistant = GigaChat(
-                access_token=access_token, model="GigaChat Max", temperature=0.2,
+                access_token=access_token, model="GigaChat", temperature=0.2,
                 verify_ssl_certs=bool(Config.CERT_PATH),
                 ca_bundle_file=Config.CERT_PATH if Path(Config.CERT_PATH).exists() else None,
                 timeout=Config.REQUEST_TIMEOUT, verbose=True
@@ -332,7 +335,6 @@ TOURISM_PROMPT_TEMPLATE = """
 """
 tourism_prompt = PromptTemplate.from_template(TOURISM_PROMPT_TEMPLATE)
 
-
 def generate_ai_response(db: Session, user_id: str, question: str, 
                          context_docs: List[Document], web_results: str,
                          conversation_summary: str, user_preferences: Dict) -> str:
@@ -346,15 +348,14 @@ def generate_ai_response(db: Session, user_id: str, question: str,
         system_prompt = tourism_prompt.format(
             question=question,
             context="\n\n".join(d.page_content for d in context_docs) if context_docs else "Нет данных в базе",
-            web_search=web_results or "Нет результатов",
+        web_search=web_results or "Нет результатов",
             conversation_summary=conversation_summary or "Нет истории",
             user_preferences=json.dumps(user_preferences, ensure_ascii=False, indent=2)
         )
 
         messages.insert(0, {"role": "system", "content": system_prompt})
 
-        # Используем GigaChat Max
-        response = ai_assistant.invoke({"model": "GigaChat Max", "messages": messages})
+        response = ai_assistant.invoke({"model": "GigaChat", "messages": messages})
         response_text = response.content if hasattr(response, "content") else str(response)
         return response_text
 
