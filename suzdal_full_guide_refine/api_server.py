@@ -287,33 +287,50 @@ def build_gigachat_messages(db: Session, user_id: str, current_question: str) ->
     
     return chat_history
 
-TOURISM_PROMPT_TEMPLATE = """
-Ты виртуальный гид по Суздалю. Ты должен показать только 2 наиболее релевантных места.
+def check_general_question(question: str) -> bool:
+    """Проверяет, является ли вопрос общим"""
+    general_patterns = [
+        r'что посмотреть', r'что посетить', r'куда сходить', r'куда пойти',
+        r'что интересного', r'достопримечательности', r'что можно посмотреть',
+        r'чем заняться', r'что делать', r'рекомендации', r'советы',
+        r'куда съездить', r'что интересное', r'места для посещения'
+    ]
+    
+    question_lower = question.lower()
+    for pattern in general_patterns:
+        if re.search(pattern, question_lower):
+            return True
+    return False
 
-Покажи ровно 2 места из базы данных. Не больше!
+def ask_clarification_questions(question: str, session: ChatSession) -> str:
+    """Задает уточняющие вопросы для общих запросов"""
+    clarification_context = session.clarification_context or {}
+    
+    # Если это первый уточняющий вопрос
+    if not clarification_context.get('clarification_step'):
+        clarification_context = {
+            'original_question': question,
+            'clarification_step': 1,
+            'user_preferences': {}
+        }
+        session.clarification_context = clarification_context
+        
+        return ("Чтобы дать вам лучшие рекомендации, расскажите немного о ваших предпочтениях:\n"
+                "1. Какой тип мест вас интересует? (музеи, храмы, рестораны, природа)\n"
+                "2. Вы путешествуете один, с семьей или друзьями?\n"
+                "3. Есть ли у вас особые интересы или ограничения?")
 
-Информация из базы:
-{context}
-
-Отвечай на русском языке. Будь полезным, дружелюбным и информативным гидом.
-Если информации недостаточно, извинись и вежливо предложи поискать в интернете.
-В конце ответа обязательно предложи поискать более актуальную информацию в интернете.
-
-Вопрос пользователя: {question}
-"""
-
-tourism_prompt = PromptTemplate.from_template(TOURISM_PROMPT_TEMPLATE)
-
-def generate_ai_response(db: Session, user_id: str, question: str, 
+def generate_rag_response(db: Session, user_id: str, question: str, 
                          context_docs: List[Document],
                          conversation_summary: str, user_preferences: Dict) -> str:
+    """Генерирует ответ на основе RAG"""
     try:
         if not token_manager.is_token_valid():
             refresh_models()
 
-        # Форматируем контекст из документов (максимум 2 места)
+        # Форматируем контекст из документов
         context_text = ""
-        limited_docs = context_docs[:Config.MAX_PLACES_TO_SHOW]  # Явно ограничиваем
+        limited_docs = context_docs[:Config.MAX_PLACES_TO_SHOW]
         
         if limited_docs:
             for i, doc in enumerate(limited_docs, 1):
@@ -325,29 +342,132 @@ def generate_ai_response(db: Session, user_id: str, question: str,
             context_text = "К сожалению, в моей локальной базе нет информации по вашему запросу."
 
         # Создаем системный промпт
-        system_prompt_text = tourism_prompt.format(
-            question=question,
-            context=context_text,
-            user_preferences=json.dumps(user_preferences, ensure_ascii=False, indent=2) if user_preferences else "Предпочтения пользователя не указаны"
-        )
+        system_prompt = f"""
+Ты виртуальный гид по Суздалю. Отвечай на основе предоставленной информации.
 
-        # Создаем сообщения в правильном формате для GigaChat
-        system_message = SystemMessage(content=system_prompt_text)
-        
-        # Получаем историю чата
+Информация из базы:
+{context_text}
+
+Отвечай на русском языке. Будь полезным, дружелюбным и информативным гидом.
+Если информации недостаточно, предложи поискать в интернете.
+
+Вопрос пользователя: {question}
+"""
+
+        # Создаем сообщения
+        system_message = SystemMessage(content=system_prompt)
         chat_history = build_gigachat_messages(db, user_id, question)
-        
-        # Формируем финальный список сообщений: системный промпт + история
         all_messages = [system_message] + chat_history
         
-        # Вызываем модель с правильным форматом ввода
+        # Вызываем модель
         response = ai_assistant.invoke(all_messages)
         response_text = response.content if hasattr(response, "content") else str(response)
         return response_text
 
     except Exception as e:
         logger.error(f"Ошибка генерации ответа: {e}")
-        return "Извините, произошла ошибка при генерации ответа. Пожалуйста, попробуйте задать вопрос еще раз."
+        return "Извините, произошла ошибка при генерации ответа."
+
+def generate_rag_response_with_offer(db: Session, user_id: str, question: str, 
+                                   context_docs: List[Document],
+                                   conversation_summary: str, user_preferences: Dict) -> str:
+    """Генерирует ответ на основе RAG с предложением поиска в интернете"""
+    try:
+        if not token_manager.is_token_valid():
+            refresh_models()
+
+        # Форматируем контекст из документов
+        context_text = ""
+        limited_docs = context_docs[:Config.MAX_PLACES_TO_SHOW]
+        
+        if limited_docs:
+            for i, doc in enumerate(limited_docs, 1):
+                name = doc.metadata.get('name', 'Неизвестно')
+                address = doc.metadata.get('address', 'Адрес не указан')
+                description = doc.page_content[:150] + "..." if len(doc.page_content) > 150 else doc.page_content
+                context_text += f"{i}. {name}\n   Адрес: {address}\n   Описание: {description}\n\n"
+        else:
+            context_text = "К сожалению, в моей локальной базе нет информации по вашему запросу."
+
+        # Создаем системный промпт с предложением поиска
+        system_prompt = f"""
+Ты виртуальный гид по Суздалю. Представь информацию из базы данных и предложи поискать более актуальную информацию в интернете.
+
+Информация из базы:
+{context_text}
+
+Отвечай на русском языке. Будь полезным, дружелюбным и информативным гидом.
+В конце ответа обязательно предложи поискать более актуальную информацию в интернете, спросив: "Хотите, чтобы я поискал более свежую информацию в интернете?"
+
+Вопрос пользователя: {question}
+"""
+
+        # Создаем сообщения
+        system_message = SystemMessage(content=system_prompt)
+        chat_history = build_gigachat_messages(db, user_id, question)
+        all_messages = [system_message] + chat_history
+        
+        # Вызываем модель
+        response = ai_assistant.invoke(all_messages)
+        response_text = response.content if hasattr(response, "content") else str(response)
+        return response_text
+
+    except Exception as e:
+        logger.error(f"Ошибка генерации ответа: {e}")
+        return "Извините, произошла ошибка. На основе моей базы данных я могу предложить: ... Хотите, чтобы я поискал более свежую информацию в интернете?"
+
+def search_web(query: str) -> List[Dict]:
+    """Поиск информации в интернете"""
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=Config.SEARCH_RESULTS))
+            return results
+    except Exception as e:
+        logger.error(f"Ошибка веб-поиска: {e}")
+        return []
+
+def generate_web_response(db: Session, user_id: str, question: str, 
+                        web_results: List[Dict],
+                        conversation_summary: str, user_preferences: Dict) -> str:
+    """Генерирует ответ на основе веб-поиска"""
+    try:
+        if not token_manager.is_token_valid():
+            refresh_models()
+
+        # Форматируем результаты поиска
+        web_context = ""
+        if web_results:
+            for i, result in enumerate(web_results[:Config.SEARCH_RESULTS], 1):
+                web_context += f"{i}. {result.get('title', 'Без названия')}\n   {result.get('body', 'Описание недоступно')}\n   URL: {result.get('href', 'Ссылка недоступна')}\n\n"
+        else:
+            web_context = "К сожалению, не удалось найти информацию в интернете."
+
+        # Создаем системный промпт для веб-ответа
+        system_prompt = f"""
+Ты виртуальный гид по Суздалю. Используй информацию из интернета, чтобы ответить на вопрос пользователя.
+
+Результаты поиска из интернета:
+{web_context}
+
+Отвечай на русском языке. Будь полезным, дружелюбным и информативным гидом.
+Представь информацию кратко и структурированно.
+
+Вопрос пользователя: {question}
+"""
+
+        # Создаем сообщения
+        system_message = SystemMessage(content=system_prompt)
+        chat_history = build_gigachat_messages(db, user_id, question)
+        all_messages = [system_message] + chat_history
+        
+        # Вызываем модель
+        response = ai_assistant.invoke(all_messages)
+        response_text = response.content if hasattr(response, "content") else str(response)
+        return response_text
+
+    except Exception as e:
+        logger.error(f"Ошибка генерации веб-ответа: {e}")
+        return "Извините, не удалось найти информацию. Попробуйте задать вопрос по-другому."
 
 def handle_question(db: Session, question: str, user_id: str) -> str:
     if not app_initialized:
@@ -371,30 +491,64 @@ def handle_question(db: Session, question: str, user_id: str) -> str:
     user_preferences = session.user_preferences if session.user_preferences else {}
     conversation_summary = session.conversation_summary if session.conversation_summary else ""
 
-    # 1. Сначала ищем в векторной базе (максимум 2 результата)
+    # 1. Проверяем, является ли вопрос общим
+    is_general_question = check_general_question(question)
+    
+    # 2. Если вопрос общий, задаем уточняющие вопросы
+    if is_general_question:
+        clarification_response = ask_clarification_questions(question, session)
+        if clarification_response:
+            # Сохраняем ответ ассистента с уточняющим вопросом
+            assistant_message = Message(session_id=user_id, role="assistant", content=clarification_response, timestamp=datetime.utcnow())
+            db.add(assistant_message)
+            session.updated_at = datetime.utcnow()
+            db.commit()
+            return clarification_response
+
+    # 3. Сначала ищем в векторной базе
     context_docs = search_in_vector_store(question)
     
-    # 2. Если в локальной базе ничего не найдено, используем фаззи-поиск (максимум 2 результата)
+    # 4. Если в локальной базе ничего не найдено, используем фаззи-поиск
     if not context_docs and documents:
         context_docs = fuzzy_retrieval(question, documents)
 
-    # 3. Явно ограничиваем количество документов
+    # 5. Явно ограничиваем количество документов
     context_docs = context_docs[:Config.MAX_PLACES_TO_SHOW]
 
-    # 4. Генерируем ответ БЕЗ веб-поиска, только предложение поискать в интернете
-    ai_answer = generate_ai_response(db, user_id, question, context_docs, conversation_summary, user_preferences)
-
-    # Сохраняем ответ ассистента
-    assistant_message = Message(session_id=user_id, role="assistant", content=ai_answer, timestamp=datetime.utcnow())
-    db.add(assistant_message)
+    # 6. Если информация найдена в RAG, предлагаем поиск в интернете
+    if context_docs:
+        # Генерируем ответ с предложением поиска в интернете
+        ai_answer = generate_rag_response_with_offer(db, user_id, question, context_docs, conversation_summary, user_preferences)
+        
+        # Сохраняем ответ ассистента с предложением
+        assistant_message = Message(session_id=user_id, role="assistant", content=ai_answer, timestamp=datetime.utcnow())
+        db.add(assistant_message)
+        
+        # Сохраняем контекст для возможного последующего поиска
+        session.clarification_context = {
+            "original_question": question,
+            "found_docs": [doc.metadata for doc in context_docs],
+            "needs_web_search": True
+        }
+        
+        session.updated_at = datetime.utcnow()
+        db.commit()
+        
+        return ai_answer
     
-    # Обновляем последний вопрос в сессии
-    session.last_question = question
-    session.updated_at = datetime.utcnow()
-    
-    db.commit()
-
-    return ai_answer
+    else:
+        # 7. Если информации в RAG нет, сразу ищем в интернете
+        web_results = search_web(question)
+        ai_answer = generate_web_response(db, user_id, question, web_results, conversation_summary, user_preferences)
+        
+        # Сохраняем ответ ассистента
+        assistant_message = Message(session_id=user_id, role="assistant", content=ai_answer, timestamp=datetime.utcnow())
+        db.add(assistant_message)
+        
+        session.updated_at = datetime.utcnow()
+        db.commit()
+        
+        return ai_answer
 
 def initialize_app():
     global embedding_model, ai_assistant, documents, vector_store, app_initialized, token_manager
@@ -431,6 +585,10 @@ class Question(BaseModel):
     question: str
     user_id: str = "default"
 
+class FollowUpResponse(BaseModel):
+    response: str
+    user_id: str = "default"
+
 @app.get("/")
 async def root():
     return {"message": "Suzdal Tourism Assistant API работает. Используйте /ask для вопросов."}
@@ -449,6 +607,64 @@ async def ask(item: Question, db: Session = Depends(get_db)):
     except Exception as e:
         logger.error(f"Ошибка обработки вопроса: {e}")
         raise HTTPException(status_code=500, detail="Ошибка обработки вопроса")
+
+@app.post("/handle_followup")
+async def handle_followup(followup: FollowUpResponse, db: Session = Depends(get_db)):
+    """Обрабатывает ответы пользователя на предложения поиска в интернете"""
+    if not app_initialized:
+        raise HTTPException(status_code=503, detail="Сервис временно недоступен.")
+    
+    session = db.query(ChatSession).filter(ChatSession.id == followup.user_id).first()
+    if not session:
+        return {"answer": "Сессия не найдена. Начните новый диалог."}
+    
+    clarification_context = session.clarification_context or {}
+    user_response = followup.response.lower().strip()
+    
+    # Если пользователь согласился на поиск в интернете
+    if clarification_context.get('needs_web_search') and user_response in ['да', 'yes', 'конечно', 'ага', 'пожалуйста', 'ищи']:
+        original_question = clarification_context.get('original_question', '')
+        web_results = search_web(original_question)
+        ai_answer = generate_web_response(db, followup.user_id, original_question, web_results, 
+                                        session.conversation_summary or "", 
+                                        session.user_preferences or {})
+        
+        # Сохраняем ответ пользователя
+        user_message = Message(session_id=followup.user_id, role="user", content=followup.response, timestamp=datetime.utcnow())
+        db.add(user_message)
+        
+        # Сохраняем ответ ассистента
+        assistant_message = Message(session_id=followup.user_id, role="assistant", content=ai_answer, timestamp=datetime.utcnow())
+        db.add(assistant_message)
+        
+        # Очищаем контекст
+        session.clarification_context = {}
+        session.updated_at = datetime.utcnow()
+        db.commit()
+        
+        return {"answer": ai_answer}
+    
+    # Если пользователь отказался от поиска
+    elif clarification_context.get('needs_web_search') and user_response in ['нет', 'no', 'не надо', 'не нужно']:
+        # Сохраняем ответ пользователя
+        user_message = Message(session_id=followup.user_id, role="user", content=followup.response, timestamp=datetime.utcnow())
+        db.add(user_message)
+        
+        # Отвечаем, что поиск не будет выполнен
+        assistant_message = Message(session_id=followup.user_id, role="assistant", 
+                                  content="Хорошо, если у вас появятся другие вопросы о Суздале, буду рад помочь!", 
+                                  timestamp=datetime.utcnow())
+        db.add(assistant_message)
+        
+        # Очищаем контекст
+        session.clarification_context = {}
+        session.updated_at = datetime.utcnow()
+        db.commit()
+        
+        return {"answer": "Хорошо, если у вас появятся другие вопросы о Суздале, буду рад помочь!"}
+    
+    else:
+        return {"answer": "Не понял ваш ответ. Пожалуйста, ответьте 'да' или 'нет'."}
 
 @app.get("/health")
 async def health_check():
