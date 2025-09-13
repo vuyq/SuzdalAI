@@ -314,8 +314,6 @@ def generate_rag_response_with_offer(
    Адрес: {address}
    Описание: {description}
 
-"
-
     # Системный промпт
     system_prompt = f"""
 Ты виртуальный гид по Суздалю. Отвечай на основе базы данных.
@@ -378,8 +376,6 @@ def generate_web_response(db: Session, user_id: str, question: str,
             web_context += f"{i}. {result.get('title','Без названия')}
    {result.get('body','')}
    URL: {result.get('href','')}
-
-"
     else:
         web_context = "К сожалению, не удалось найти информацию в интернете."
 
