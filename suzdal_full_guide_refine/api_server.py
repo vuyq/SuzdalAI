@@ -91,6 +91,7 @@ class Config:
     TOKEN_EXPIRY_MINUTES = 25
     MEMORY_CONTEXT_SIZE = 10
     PREFERENCES_UPDATE_INTERVAL = 5
+    RAG_CONFIDENCE_THRESHOLD = 0.3  # Порог уверенности для RAG-поиска
 
 # Глобальные переменные
 embedding_model = None
@@ -248,11 +249,37 @@ def search_in_vector_store(query: str, k: int = Config.MAX_PLACES_TO_SHOW) -> Li
         return []
     
     try:
-        results = vector_store.similarity_search(query, k=k)
-        return results[:Config.MAX_PLACES_TO_SHOW]  # Явно ограничиваем количество
+        # Используем similarity_search_with_score для получения оценок релевантности
+        results_with_scores = vector_store.similarity_search_with_score(query, k=k)
+        
+        # Фильтруем результаты по порогу уверенности
+        filtered_results = []
+        for doc, score in results_with_scores:
+            if score <= Config.RAG_CONFIDENCE_THRESHOLD:  # Чем меньше score, тем лучше соответствие
+                filtered_results.append(doc)
+        
+        return filtered_results[:Config.MAX_PLACES_TO_SHOW]
     except Exception as e:
         logger.error(f"Ошибка поиска в векторной базе: {e}")
         return []
+
+def is_relevant_rag_results(docs: List[Document], query: str) -> bool:
+    """Проверяет, являются ли результаты RAG релевантными запросу"""
+    if not docs:
+        return False
+    
+    # Проверяем релевантность по ключевым словам
+    query_keywords = set(query.lower().split())
+    
+    for doc in docs:
+        doc_content = f"{doc.page_content} {json.dumps(doc.metadata)}".lower()
+        doc_keywords = set(doc_content.split())
+        
+        # Если есть пересечение ключевых слов, считаем релевантным
+        if query_keywords.intersection(doc_keywords):
+            return True
+    
+    return False
 
 def fuzzy_retrieval(question: str, docs: List[Document], limit: int = Config.MAX_PLACES_TO_SHOW) -> List[Document]:
     if not docs:
@@ -269,7 +296,7 @@ def fuzzy_retrieval(question: str, docs: List[Document], limit: int = Config.MAX
     for match_text, score, idx in matches:
         if score > 50:
             results.append(docs[idx])
-    return results[:Config.MAX_PLACES_TO_SHOW]  # Явно ограничиваем количество
+    return results[:Config.MAX_PLACES_TO_SHOW]
 
 def build_gigachat_messages(db: Session, user_id: str, current_question: str) -> List:
     """Формируем массив сообщений для GigaChat в правильном формате"""
@@ -403,6 +430,7 @@ def generate_web_response(db: Session, user_id: str, question: str,
 
 Отвечай на русском языке. Будь полезным, дружелюбным и информативным гидом.
 Представь информацию кратко и структурированно.
+Упомяни, что информация найдена в интернете.
 
 Вопрос пользователя: {question}
 """
@@ -464,11 +492,15 @@ def handle_question(db: Session, question: str, user_id: str) -> str:
     if not context_docs and documents:
         context_docs = fuzzy_retrieval(question, documents)
 
-    # 5. Явно ограничиваем количество документов
+    # 5. Проверяем релевантность найденных результатов
+    rag_has_relevant_info = is_relevant_rag_results(context_docs, question)
+    
+    # 6. Явно ограничиваем количество документов
     context_docs = context_docs[:Config.MAX_PLACES_TO_SHOW]
 
-    # 6. Если информация найдена в RAG, генерируем ответ
-    if context_docs:
+    # 7. Если информация найдена в RAG и она релевантна, генерируем ответ на основе RAG
+    if context_docs and rag_has_relevant_info:
+        logger.info(f"Найдена релевантная информация в RAG для запроса: {question}")
         ai_answer = generate_rag_response(db, user_id, question, context_docs, conversation_summary, user_preferences)
         
         # Сохраняем ответ ассистента
@@ -481,7 +513,8 @@ def handle_question(db: Session, question: str, user_id: str) -> str:
         return ai_answer
     
     else:
-        # 7. Если информации в RAG нет, сразу ищем в интернете
+        # 8. Если информации в RAG нет или она нерелевантна, ищем в интернете
+        logger.info(f"Информация в RAG не найдена или нерелевантна, ищем в интернете: {question}")
         web_results = search_web(question)
         ai_answer = generate_web_response(db, user_id, question, web_results, conversation_summary, user_preferences)
         
