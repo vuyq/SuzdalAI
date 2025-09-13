@@ -628,8 +628,12 @@ async def handle_followup(followup: FollowUpResponse, db: Session = Depends(get_
     clarification_context = session.clarification_context or {}
     user_response = followup.response.lower().strip()
     
+    # Проверяем различные варианты положительного ответа
+    positive_responses = ['да', 'yes', 'конечно', 'ага', 'пожалуйста', 'ищи', 'поищи', 'найди', 'искать', 'поискать']
+    negative_responses = ['нет', 'no', 'не надо', 'не нужно', 'не стоит', 'отмена']
+    
     # Если пользователь согласился на поиск в интернете
-    if clarification_context.get('needs_web_search') and user_response in ['да', 'yes', 'конечно', 'ага', 'пожалуйста', 'ищи']:
+    if clarification_context.get('needs_web_search') and any(pos in user_response for pos in positive_responses):
         original_question = clarification_context.get('original_question', '')
         web_results = search_web(original_question)
         ai_answer = generate_web_response(db, followup.user_id, original_question, web_results, 
@@ -652,14 +656,15 @@ async def handle_followup(followup: FollowUpResponse, db: Session = Depends(get_
         return {"answer": ai_answer}
     
     # Если пользователь отказался от поиска
-    elif clarification_context.get('needs_web_search') and user_response in ['нет', 'no', 'не надо', 'не нужно']:
+    elif clarification_context.get('needs_web_search') and any(neg in user_response for neg in negative_responses):
         # Сохраняем ответ пользователя
         user_message = Message(session_id=followup.user_id, role="user", content=followup.response, timestamp=datetime.utcnow())
         db.add(user_message)
         
         # Отвечаем, что поиск не будет выполнен
+        assistant_response = "Хорошо, если у вас появятся другие вопросы о Суздале, буду рад помочь!"
         assistant_message = Message(session_id=followup.user_id, role="assistant", 
-                                  content="Хорошо, если у вас появятся другие вопросы о Суздале, буду рад помочь!", 
+                                  content=assistant_response, 
                                   timestamp=datetime.utcnow())
         db.add(assistant_message)
         
@@ -668,11 +673,23 @@ async def handle_followup(followup: FollowUpResponse, db: Session = Depends(get_
         session.updated_at = datetime.utcnow()
         db.commit()
         
-        return {"answer": "Хорошо, если у вас появятся другие вопросы о Суздале, буду рад помочь!"}
+        return {"answer": assistant_response}
     
     else:
-        return {"answer": "Не понял ваш ответ. Пожалуйста, ответьте 'да' или 'нет'."}
-
+        # Если ответ не распознан
+        user_message = Message(session_id=followup.user_id, role="user", content=followup.response, timestamp=datetime.utcnow())
+        db.add(user_message)
+        
+        assistant_response = "Извините, я не понял ваш ответ. Пожалуйста, ответьте 'да' если хотите поиск в интернете, или 'нет' если не хотите."
+        assistant_message = Message(session_id=followup.user_id, role="assistant", 
+                                  content=assistant_response, 
+                                  timestamp=datetime.utcnow())
+        db.add(assistant_message)
+        
+        session.updated_at = datetime.utcnow()
+        db.commit()
+        
+        return {"answer": assistant_response}
 @app.get("/health")
 async def health_check():
     status = "healthy" if app_initialized and documents else "degraded"
