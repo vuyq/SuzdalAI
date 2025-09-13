@@ -1,5 +1,3 @@
-замени модель на GigaChat Max
-
 import os
 import requests
 import pandas as pd
