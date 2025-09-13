@@ -14,7 +14,6 @@ from langchain_core.documents import Document
 from langchain_gigachat import GigaChat, GigaChatEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.prompts import PromptTemplate
-from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from tenacity import retry, stop_after_attempt, wait_exponential
 from ddgs import DDGS
 from rapidfuzz import process, fuzz
@@ -45,7 +44,7 @@ Base = declarative_base()
 
 # Модели базы данных
 class ChatSession(Base):
-    __tablename__ = "chat_sessions"
+    tablename = "chat_sessions"
     id = Column(String(100), primary_key=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -56,7 +55,7 @@ class ChatSession(Base):
     messages = relationship("Message", back_populates="session", cascade="all, delete-orphan")
 
 class Message(Base):
-    __tablename__ = "messages"
+    tablename = "messages"
     id = Column(Integer, primary_key=True, autoincrement=True)
     session_id = Column(String(100), ForeignKey("chat_sessions.id"), nullable=False)
     role = Column(String(10), nullable=False)
@@ -80,7 +79,7 @@ class Config:
     MAX_RETRIES = 3
     REQUEST_TIMEOUT = 15
     SEARCH_RESULTS = 3
-    MAX_PLACES_TO_SHOW = 2  # Максимальное количество мест для показа
+    RETRIEVER_K = 5
     CERT_PATH = os.getenv("CERT_PATH", "./cert.pem")
     CERT_URL = os.getenv("CERT_URL")
     GIGACHAT_AUTH = os.getenv("GIGACHAT_AUTH")
@@ -91,13 +90,14 @@ class Config:
     TOKEN_EXPIRY_MINUTES = 25
     MEMORY_CONTEXT_SIZE = 10
     PREFERENCES_UPDATE_INTERVAL = 5
-    RAG_CONFIDENCE_THRESHOLD = 0.3  # Порог уверенности для RAG-поиска
+    SEMANTIC_SEARCH_K = 3
 
 # Глобальные переменные
 embedding_model = None
 ai_assistant = None
 documents = []
 vector_store = None
+document_retriever = None
 app_initialized = False
 token_manager = None
 
@@ -244,44 +244,31 @@ def load_data() -> List[Document]:
         documents.append(doc)
     return documents
 
-def search_in_vector_store(query: str, k: int = Config.MAX_PLACES_TO_SHOW) -> List[Document]:
-    if not vector_store:
+@lru_cache(maxsize=100)
+def perform_web_search(query: str) -> str:
+    try:
+        results = []
+        with DDGS() as ddgs:
+            for r in ddgs.text(f"{query} Суздаль", max_results=Config.SEARCH_RESULTS, timelimit='y'):
+                results.append(f"• {r['title']}\n  {r['href']}\n  {r['body'][:200]}...")
+        return "\n\n".join(results) if results else "Не найдено результатов"
+    except Exception as e:
+        logger.error(f"Ошибка веб-поиска: {e}")
+        return "Ошибка при выполнении поиска"
+
+def search_in_vector_store(query: str, k: int = None) -> List[Document]:
+    if not vector_store or not document_retriever:
         return []
     
     try:
-        # Используем similarity_search_with_score для получения оценок релевантности
-        results_with_scores = vector_store.similarity_search_with_score(query, k=k)
-        
-        # Фильтруем результаты по порогу уверенности
-        filtered_results = []
-        for doc, score in results_with_scores:
-            if score <= Config.RAG_CONFIDENCE_THRESHOLD:  # Чем меньше score, тем лучше соответствие
-                filtered_results.append(doc)
-        
-        return filtered_results[:Config.MAX_PLACES_TO_SHOW]
+        k = k or Config.RETRIEVER_K
+        results = vector_store.similarity_search(query, k=k)
+        return results
     except Exception as e:
         logger.error(f"Ошибка поиска в векторной базе: {e}")
         return []
 
-def is_relevant_rag_results(docs: List[Document], query: str) -> bool:
-    """Проверяет, являются ли результаты RAG релевантными запросу"""
-    if not docs:
-        return False
-    
-    # Проверяем релевантность по ключевым словам
-    query_keywords = set(query.lower().split())
-    
-    for doc in docs:
-        doc_content = f"{doc.page_content} {json.dumps(doc.metadata)}".lower()
-        doc_keywords = set(doc_content.split())
-        
-        # Если есть пересечение ключевых слов, считаем релевантным
-        if query_keywords.intersection(doc_keywords):
-            return True
-    
-    return False
-
-def fuzzy_retrieval(question: str, docs: List[Document], limit: int = Config.MAX_PLACES_TO_SHOW) -> List[Document]:
+def fuzzy_retrieval(question: str, docs: List[Document], limit: int = 5) -> List[Document]:
     if not docs:
         return []
     
@@ -296,98 +283,77 @@ def fuzzy_retrieval(question: str, docs: List[Document], limit: int = Config.MAX
     for match_text, score, idx in matches:
         if score > 50:
             results.append(docs[idx])
-    return results[:Config.MAX_PLACES_TO_SHOW]
+    return results
 
-def build_gigachat_messages(db: Session, user_id: str, current_question: str) -> List:
-    """Формируем массив сообщений для GigaChat в правильном формате"""
+def cosine_similarity(vec1, vec2):
+    if not vec1 or not vec2:
+        return 0.0
+    dot_product = sum(a * b for a, b in zip(vec1, vec2))
+    norm1 = sum(a * a for a in vec1) ** 0.5
+    norm2 = sum(b * b for b in vec2) ** 0.5
+    return dot_product / (norm1 * norm2) if norm1 and norm2 else 0.0
+
+# --- новые функции ---
+
+def build_gigachat_messages(db: Session, user_id: str, current_question: str) -> List[Dict[str, str]]:
+    """Формируем массив сообщений для GigaChat API"""
     messages = db.query(Message).filter(Message.session_id == user_id).order_by(Message.timestamp.asc()).all()
     
     chat_history = []
     for msg in messages:
-        if msg.role == "user":
-            chat_history.append(HumanMessage(content=msg.content))
-        elif msg.role == "assistant":
-            chat_history.append(AIMessage(content=msg.content))
+        chat_history.append({
+            "role": msg.role,
+            "content": msg.content
+        })
     
     # Добавляем текущий вопрос
-    chat_history.append(HumanMessage(content=current_question))
+    chat_history.append({"role": "user", "content": current_question})
     
     return chat_history
 
-def check_general_question(question: str) -> bool:
-    """Проверяет, является ли вопрос общим"""
-    general_patterns = [
-        r'что посмотреть', r'что посетить', r'куда сходить', r'куда пойти',
-        r'что интересного', r'достопримечательности', r'что можно посмотреть',
-        r'чем заняться', r'что делать', r'рекомендации', r'советы',
-        r'куда съездить', r'что интересное', r'места для посещения'
-    ]
-    
-    question_lower = question.lower()
-    for pattern in general_patterns:
-        if re.search(pattern, question_lower):
-            return True
-    return False
+TOURISM_PROMPT_TEMPLATE = """
+Ты виртуальный гид по Суздалю. Учитывай контекст предыдущего диалога и предпочтения пользователя.
 
-def ask_clarification_questions(question: str, session: ChatSession) -> str:
-    """Задает уточняющие вопросы для общих запросов"""
-    clarification_context = session.clarification_context or {}
-    
-    # Если это первый уточняющий вопрос
-    if not clarification_context.get('clarification_step'):
-        clarification_context = {
-            'original_question': question,
-            'clarification_step': 1,
-            'user_preferences': {}
-        }
-        session.clarification_context = clarification_context
-        
-        return ("Чтобы дать вам лучшие рекомендации, расскажите немного о ваших предпочтениях:\n"
-                "1. Какой тип мест вас интересует? (музеи, храмы, рестораны, природа)\n"
-                "2. Вы путешествуете один, с семьей или друзьями?\n"
-                "3. Есть ли у вас особые интересы или ограничения?")
+[Семантическая память диалога]:
+{conversation_summary}
 
-def generate_rag_response(db: Session, user_id: str, question: str, 
-                         context_docs: List[Document],
+[Предпочтения пользователя]:
+{user_preferences}
+
+[Данные из базы о достопримечательностях]:
+{context}
+
+[Веб-результаты]:
+{web_search}
+
+[Текущий вопрос]:
+{question}
+
+Отвечай на русском языке.
+"""
+tourism_prompt = PromptTemplate.from_template(TOURISM_PROMPT_TEMPLATE)
+
+def generate_ai_response(db: Session, user_id: str, question: str, 
+                         context_docs: List[Document], web_results: str,
                          conversation_summary: str, user_preferences: Dict) -> str:
-    """Генерирует ответ на основе RAG"""
     try:
         if not token_manager.is_token_valid():
             refresh_models()
 
-        # Форматируем контекст из документов
-        context_text = ""
-        limited_docs = context_docs[:Config.MAX_PLACES_TO_SHOW]
-        
-        if limited_docs:
-            for i, doc in enumerate(limited_docs, 1):
-                name = doc.metadata.get('name', 'Неизвестно')
-                address = doc.metadata.get('address', 'Адрес не указан')
-                description = doc.page_content[:150] + "..." if len(doc.page_content) > 150 else doc.page_content
-                context_text += f"{i}. {name}\n   Адрес: {address}\n   Описание: {description}\n\n"
-        else:
-            context_text = "К сожалению, в моей локальной базе нет информации по вашему запросу."
+        messages = build_gigachat_messages(db, user_id, question)
 
-        # Создаем системный промпт
-        system_prompt = f"""
-Ты виртуальный гид по Суздалю. Отвечай на основе предоставленной информации.
+        # Системный промпт
+        system_prompt = tourism_prompt.format(
+            question=question,
+            context="\n\n".join(d.page_content for d in context_docs) if context_docs else "Нет данных в базе",
+        web_search=web_results or "Нет результатов",
+            conversation_summary=conversation_summary or "Нет истории",
+            user_preferences=json.dumps(user_preferences, ensure_ascii=False, indent=2)
+        )
 
-Информация из базы:
-{context_text}
+        messages.insert(0, {"role": "system", "content": system_prompt})
 
-Отвечай на русском языке. Будь полезным, дружелюбным и информативным гидом.
-Если информации недостаточно, предложи поискать в интернете.
-
-Вопрос пользователя: {question}
-"""
-
-        # Создаем сообщения
-        system_message = SystemMessage(content=system_prompt)
-        chat_history = build_gigachat_messages(db, user_id, question)
-        all_messages = [system_message] + chat_history
-        
-        # Вызываем модель
-        response = ai_assistant.invoke(all_messages)
+        response = ai_assistant.invoke({"model": "GigaChat", "messages": messages})
         response_text = response.content if hasattr(response, "content") else str(response)
         return response_text
 
@@ -395,59 +361,7 @@ def generate_rag_response(db: Session, user_id: str, question: str,
         logger.error(f"Ошибка генерации ответа: {e}")
         return "Извините, произошла ошибка при генерации ответа."
 
-def search_web(query: str) -> List[Dict]:
-    """Поиск информации в интернете"""
-    try:
-        with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=Config.SEARCH_RESULTS))
-            return results
-    except Exception as e:
-        logger.error(f"Ошибка веб-поиска: {e}")
-        return []
-
-def generate_web_response(db: Session, user_id: str, question: str, 
-                        web_results: List[Dict],
-                        conversation_summary: str, user_preferences: Dict) -> str:
-    """Генерирует ответ на основе веб-поиска"""
-    try:
-        if not token_manager.is_token_valid():
-            refresh_models()
-
-        # Форматируем результаты поиска
-        web_context = ""
-        if web_results:
-            for i, result in enumerate(web_results[:Config.SEARCH_RESULTS], 1):
-                web_context += f"{i}. {result.get('title', 'Без названия')}\n   {result.get('body', 'Описание недоступно')}\n   URL: {result.get('href', 'Ссылка недоступна')}\n\n"
-        else:
-            web_context = "К сожалению, не удалось найти информацию в интернете."
-
-        # Создаем системный промпт для веб-ответа
-        system_prompt = f"""
-Ты виртуальный гид по Суздалю. Используй информацию из интернета, чтобы ответить на вопрос пользователя.
-
-Результаты поиска из интернета:
-{web_context}
-
-Отвечай на русском языке. Будь полезным, дружелюбным и информативным гидом.
-Представь информацию кратко и структурированно.
-Упомяни, что информация найдена в интернете.
-
-Вопрос пользователя: {question}
-"""
-
-        # Создаем сообщения
-        system_message = SystemMessage(content=system_prompt)
-        chat_history = build_gigachat_messages(db, user_id, question)
-        all_messages = [system_message] + chat_history
-        
-        # Вызываем модель
-        response = ai_assistant.invoke(all_messages)
-        response_text = response.content if hasattr(response, "content") else str(response)
-        return response_text
-
-    except Exception as e:
-        logger.error(f"Ошибка генерации веб-ответа: {e}")
-        return "Извините, не удалось найти информацию. Попробуйте задать вопрос по-другому."
+# --- основные обработчики остаются, но handle_question обновим ---
 
 def handle_question(db: Session, question: str, user_id: str) -> str:
     if not app_initialized:
@@ -457,78 +371,33 @@ def handle_question(db: Session, question: str, user_id: str) -> str:
     if not question:
         return "Пожалуйста, задайте ваш вопрос о Суздале."
 
-    # Получаем или создаем сессию
     session = db.query(ChatSession).filter(ChatSession.id == user_id).first()
-    if not session:
-        session = ChatSession(id=user_id, user_preferences={}, conversation_summary="")
-        db.add(session)
-        db.commit()
 
-    # Сохраняем вопрос пользователя
-    user_message = Message(session_id=user_id, role="user", content=question, timestamp=datetime.utcnow())
-    db.add(user_message)
+    # сохраняем вопрос пользователя
+    from datetime import datetime
+    db.add(Message(session_id=user_id, role="user", content=question, timestamp=datetime.utcnow()))
+    db.commit()
 
-    user_preferences = session.user_preferences if session.user_preferences else {}
-    conversation_summary = session.conversation_summary if session.conversation_summary else ""
+    user_preferences = session.user_preferences if session and session.user_preferences else {}
+    conversation_summary = session.conversation_summary if session else ""
 
-    # 1. Проверяем, является ли вопрос общим
-    is_general_question = check_general_question(question)
-    
-    # 2. Если вопрос общий, задаем уточняющие вопросы
-    if is_general_question:
-        clarification_response = ask_clarification_questions(question, session)
-        if clarification_response:
-            # Сохраняем ответ ассистента с уточняющим вопросом
-            assistant_message = Message(session_id=user_id, role="assistant", content=clarification_response, timestamp=datetime.utcnow())
-            db.add(assistant_message)
-            session.updated_at = datetime.utcnow()
-            db.commit()
-            return clarification_response
-
-    # 3. Сначала ищем в векторной базе
     context_docs = search_in_vector_store(question)
-    
-    # 4. Если в локальной базе ничего не найдено, используем фаззи-поиск
     if not context_docs and documents:
-        context_docs = fuzzy_retrieval(question, documents)
+        context_docs = fuzzy_retrieval(question, documents, limit=Config.RETRIEVER_K)
 
-    # 5. Проверяем релевантность найденных результатов
-    rag_has_relevant_info = is_relevant_rag_results(context_docs, question)
-    
-    # 6. Явно ограничиваем количество документов
-    context_docs = context_docs[:Config.MAX_PLACES_TO_SHOW]
+    ai_answer = generate_ai_response(db, user_id, question, context_docs, "", conversation_summary, user_preferences)
 
-    # 7. Если информация найдена в RAG и она релевантна, генерируем ответ на основе RAG
-    if context_docs and rag_has_relevant_info:
-        logger.info(f"Найдена релевантная информация в RAG для запроса: {question}")
-        ai_answer = generate_rag_response(db, user_id, question, context_docs, conversation_summary, user_preferences)
-        
-        # Сохраняем ответ ассистента
-        assistant_message = Message(session_id=user_id, role="assistant", content=ai_answer, timestamp=datetime.utcnow())
-        db.add(assistant_message)
-        
-        session.updated_at = datetime.utcnow()
-        db.commit()
-        
-        return ai_answer
-    
-    else:
-        # 8. Если информации в RAG нет или она нерелевантна, ищем в интернете
-        logger.info(f"Информация в RAG не найдена или нерелевантна, ищем в интернете: {question}")
-        web_results = search_web(question)
-        ai_answer = generate_web_response(db, user_id, question, web_results, conversation_summary, user_preferences)
-        
-        # Сохраняем ответ ассистента
-        assistant_message = Message(session_id=user_id, role="assistant", content=ai_answer, timestamp=datetime.utcnow())
-        db.add(assistant_message)
-        
-        session.updated_at = datetime.utcnow()
-        db.commit()
-        
-        return ai_answer
-        
+    response = ai_answer
+
+    db.add(Message(session_id=user_id, role="assistant", content=response, timestamp=datetime.utcnow()))
+    db.commit()
+
+    return response
+
+# --- инициализация приложения ---
+
 def initialize_app():
-    global embedding_model, ai_assistant, documents, vector_store, app_initialized, token_manager
+    global embedding_model, ai_assistant, documents, vector_store, document_retriever, app_initialized, token_manager
     
     try:
         download_certificate()
@@ -537,9 +406,8 @@ def initialize_app():
         documents = load_data()
         
         if documents:
-            texts = [doc.page_content for doc in documents]
-            metadatas = [doc.metadata for doc in documents]
-            vector_store = FAISS.from_texts(texts, embedding_model, metadatas=metadatas)
+            vector_store = FAISS.from_documents(documents, embedding_model)
+            document_retriever = vector_store.as_retriever(search_kwargs={"k": Config.RETRIEVER_K})
             logger.info(f"Приложение успешно инициализировано, загружено {len(documents)} документов")
         else:
             logger.warning("Документы не загружены, RAG будет работать в ограниченном режиме")
@@ -552,7 +420,6 @@ def initialize_app():
         app_initialized = False
         raise
 
-# Инициализация приложения
 initialize_app()
 
 app = FastAPI(title="Суздаль Tourism Assistant")
@@ -587,11 +454,11 @@ async def health_check():
     return {
         "status": status, 
         "initialized": app_initialized,
-        "timestamp": datetime.utcnow(),
+    "timestamp": datetime.utcnow(),
         "documents_loaded": len(documents),
         "token_valid": token_manager.is_token_valid() if token_manager else False
     }
 
-if __name__ == "__main__":
+if name == "__main__":
     port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
