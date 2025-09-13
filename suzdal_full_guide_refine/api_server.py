@@ -371,7 +371,7 @@ def generate_rag_response(db: Session, user_id: str, question: str,
 def generate_rag_response_with_offer(db: Session, user_id: str, question: str, 
                                    context_docs: List[Document],
                                    conversation_summary: str, user_preferences: Dict) -> str:
-    """Генерирует ответ на основе RAG с предложением поиска в интернете"""
+    """Генерирует ответ на основе RAG с явным предложением поиска в интернете"""
     try:
         if not token_manager.is_token_valid():
             refresh_models()
@@ -389,15 +389,18 @@ def generate_rag_response_with_offer(db: Session, user_id: str, question: str,
         else:
             context_text = "К сожалению, в моей локальной базе нет информации по вашему запросу."
 
-        # Создаем системный промпт с предложением поиска
+        # Создаем системный промпт с явным указанием предложить поиск
         system_prompt = f"""
-Ты виртуальный гид по Суздалю. Представь информацию из базы данных и предложи поискать более актуальную информацию в интернете.
+Ты виртуальный гид по Суздалю. Твоя задача:
+1. Представить информацию из базы данных
+2. В КОНЦЕ ответа обязательно предложить поискать более актуальную информацию в интернете
+3. Использовать точную фразу: "Хотите, чтобы я поискал более свежую информацию в интернете?"
 
 Информация из базы:
 {context_text}
 
 Отвечай на русском языке. Будь полезным, дружелюбным и информативным гидом.
-В конце ответа обязательно предложи поискать более актуальную информацию в интернете, спросив: "Хотите, чтобы я поискал более свежую информацию в интернете?"
+Сначала представь информацию из базы, затем предложи поиск в интернете.
 
 Вопрос пользователя: {question}
 """
@@ -410,12 +413,16 @@ def generate_rag_response_with_offer(db: Session, user_id: str, question: str,
         # Вызываем модель
         response = ai_assistant.invoke(all_messages)
         response_text = response.content if hasattr(response, "content") else str(response)
+        
+        # Если модель не добавила предложение о поиске, добавляем его вручную
+        if "интернете" not in response_text.lower() and "поискал" not in response_text.lower():
+            response_text += "\n\nХотите, чтобы я поискал более свежую информацию в интернете?"
+            
         return response_text
 
     except Exception as e:
         logger.error(f"Ошибка генерации ответа: {e}")
-        return "Извините, произошла ошибка. На основе моей базы данных я могу предложить: ... Хотите, чтобы я поискал более свежую информацию в интернете?"
-
+        return "Извините, произошла ошибка. На основе моей базы данных я могу предложить некоторую информацию. Хотите, чтобы я поискал более свежую информацию в интернете?"
 def search_web(query: str) -> List[Dict]:
     """Поиск информации в интернете"""
     try:
@@ -549,7 +556,7 @@ def handle_question(db: Session, question: str, user_id: str) -> str:
         db.commit()
         
         return ai_answer
-
+        
 def initialize_app():
     global embedding_model, ai_assistant, documents, vector_store, app_initialized, token_manager
     
