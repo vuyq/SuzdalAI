@@ -181,12 +181,7 @@ def refresh_models():
     if ai_assistant:
         ai_assistant.access_token = access_token
     else:
-        ai_assistant = GigaChat(
-            access_token=access_token, model="GigaChat", temperature=0.2,
-            verify_ssl_certs=bool(Config.CERT_PATH),
-            ca_bundle_file=Config.CERT_PATH if Path(Config.CERT_PATH).exists() else None,
-            timeout=Config.REQUEST_TIMEOUT, verbose=True
-        )
+        embedding_model, ai_assistant = initialize_models()
     logger.info("Модели успешно обновлены с новым токеном")
 
 
@@ -223,8 +218,7 @@ def load_data() -> List[Document]:
         if 'name' not in metadata:
             continue
         doc = Document(
-            page_content="
-".join(content) if content else metadata.get('description', ''),
+            page_content="\n".join(content) if content else metadata.get('description', ''),
             metadata=metadata
         )
         documents.append(doc)
@@ -284,12 +278,9 @@ def ask_clarification_questions(question: str, session: ChatSession) -> str:
             'user_preferences': {}
         }
         session.clarification_context = clarification_context
-        return ("Чтобы дать лучшие рекомендации, расскажите о ваших предпочтениях:
-"
-                "1. Какой тип мест вас интересует?
-"
-                "2. Вы путешествуете один, с семьей или друзьями?
-"
+        return ("Чтобы дать лучшие рекомендации, расскажите о ваших предпочтениях:\n"
+                "1. Какой тип мест вас интересует?\n"
+                "2. Вы путешествуете один, с семьей или друзьями?\n"
                 "3. Есть ли особые интересы или ограничения?")
 
 
@@ -310,9 +301,7 @@ def generate_rag_response_with_offer(
         name = doc.metadata.get("name", "Неизвестно")
         address = doc.metadata.get("address", "Адрес не указан")
         description = doc.page_content[:150] + "..." if len(doc.page_content) > 150 else doc.page_content
-        context_text += f"{i}. {name}
-   Адрес: {address}
-   Описание: {description}
+        context_text += f"{i}. {name}\n   Адрес: {address}\n   Описание: {description}\n\n"
 
     # Системный промпт
     system_prompt = f"""
@@ -336,9 +325,7 @@ def generate_rag_response_with_offer(
     # ✅ Жёстко добавляем, если модель забыла
     offer_text = "Хотите, чтобы я поискал более свежую информацию в интернете?"
     if offer_text.lower() not in response_text.lower():
-        response_text = response_text.strip() + "
-
-" + offer_text
+        response_text = response_text.strip() + "\n\n" + offer_text
 
     return response_text
 
@@ -373,9 +360,7 @@ def generate_web_response(db: Session, user_id: str, question: str,
     web_context = ""
     if web_results:
         for i, result in enumerate(web_results[:Config.SEARCH_RESULTS], 1):
-            web_context += f"{i}. {result.get('title','Без названия')}
-   {result.get('body','')}
-   URL: {result.get('href','')}
+            web_context += f"{i}. {result.get('title','Без названия')}\n   {result.get('body','')}\n   URL: {result.get('href','')}\n\n"
     else:
         web_context = "К сожалению, не удалось найти информацию в интернете."
 
