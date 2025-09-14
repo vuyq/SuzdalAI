@@ -54,6 +54,62 @@ class Message(Base):
     role = Column(String(10), nullable=False)
     content = Column(Text, nullable=False)
     timestamp = Column(DateTime, default=datetime.utcnow)
+    message_metadata = Column(JSON, nullable=True)import os
+import requests
+import pandas as pd
+from pathlib import Path
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import create_engine, Column, String, Text, DateTime, Integer
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.dialects.postgresql import JSON
+from datetime import datetime
+from pydantic import BaseModel
+from langchain_core.documents import Document
+from langchain_gigachat import GigaChat, GigaChatEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_core.prompts import PromptTemplate
+from tenacity import retry, stop_after_attempt, wait_exponential
+from ddgs import DDGS
+import logging
+from typing import Dict, List, Optional, Tuple
+import uuid
+import re
+
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Загрузка переменных окружения
+load_dotenv()
+
+# Настройки базы данных
+DATABASE_URL = os.getenv("DATABASE_URL")
+if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+# Модели базы данных
+class ChatSession(Base):
+    __tablename__ = "chat_sessions"
+    
+    id = Column(String(100), primary_key=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+class Message(Base):
+    __tablename__ = "messages"
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    session_id = Column(String(100), nullable=False)
+    role = Column(String(10), nullable=False)
+    content = Column(Text, nullable=False)
+    timestamp = Column(DateTime, default=datetime.utcnow)
     message_metadata = Column(JSON, nullable=True)
 
 # Создание таблиц
@@ -100,6 +156,12 @@ class Config:
         "какой бюджет",
         "где расположение"
     ]
+    
+    # Минимальное количество букв для осмысленного слова
+    MIN_WORD_LENGTH = 3
+    
+    # Максимальное количество опечаток в слове
+    MAX_TYPOS_PER_WORD = 2
 
 def download_certificate():
     """Загрузка SSL-сертификата при необходимости"""
@@ -117,7 +179,7 @@ def download_certificate():
 @retry(stop=stop_after_attempt(Config.MAX_RETRIES), 
       wait=wait_exponential(multiplier=1, min=2, max=10))
 def get_gigachat_token() -> str:
-    """Получение токена доaccess GigaChat"""
+    """Получение токена доступа GigaChat"""
     url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
     headers = {
         'Content-Type': 'application/x-www-form-urlencoded',
@@ -280,6 +342,89 @@ def is_clarification_request(text: str) -> bool:
         return False
     text_lower = text.lower()
     return any(phrase in text_lower for phrase in Config.CLARIFICATION_PHRASES)
+
+def levenshtein_distance(s1: str, s2: str) -> int:
+    """Вычисляет расстояние Левенштейна между двумя строками"""
+    if len(s1) < len(s2):
+        return levenshtein_distance(s2, s1)
+    
+    if len(s2) == 0:
+        return len(s1)
+    
+    previous_row = range(len(s2) + 1)
+    for i, c1 in enumerate(s1):
+        current_row = [i + 1]
+        for j, c2 in enumerate(s2):
+            insertions = previous_row[j + 1] + 1
+            deletions = current_row[j] + 1
+            substitutions = previous_row[j] + (c1 != c2)
+            current_row.append(min(insertions, deletions, substitutions))
+        previous_row = current_row
+    
+    return previous_row[-1]
+
+def is_gibberish(text: str) -> bool:
+    """Проверяет, является ли текст бессмысленным набором символов"""
+    # Удаляем все не-буквенные символы
+    words = re.findall(r'\b[а-яa-z]+\b', text.lower())
+    
+    if not words:
+        return True
+    
+    # Проверяем каждое слово
+    for word in words:
+        if len(word) >= Config.MIN_WORD_LENGTH:
+            # Проверяем, есть ли это слово в известных ключевых словах
+            found_similar = False
+            all_keywords = (Config.FOOD_KEYWORDS + Config.MUSEUM_KEYWORDS + 
+                          Config.ATTRACTION_KEYWORDS + Config.ACCOMMODATION_KEYWORDS + 
+                          Config.TRANSPORT_KEYWORDS)
+            
+            for keyword in all_keywords:
+                if len(word) >= Config.MIN_WORD_LENGTH and levenshtein_distance(word, keyword) <= Config.MAX_TYPOS_PER_WORD:
+                    found_similar = True
+                    break
+            
+            if not found_similar:
+                # Если слово длинное и не похоже ни на одно ключевое - вероятно опечатка
+                if len(word) > 5:
+                    return True
+    
+    return False
+
+def contains_meaningful_words(text: str) -> bool:
+    """Проверяет, содержит ли текст осмысленные слова"""
+    words = re.findall(r'\b[а-яa-z]+\b', text.lower())
+    
+    meaningful_words = 0
+    all_keywords = (Config.FOOD_KEYWORDS + Config.MUSEUM_KEYWORDS + 
+                  Config.ATTRACTION_KEYWORDS + Config.ACCOMMODATION_KEYWORDS + 
+                  Config.TRANSPORT_KEYWORDS + 
+                  ["суздаль", "город", "посмотреть", "посетить", "где", "как", "что", "когда"])
+    
+    for word in words:
+        if len(word) >= Config.MIN_WORD_LENGTH:
+            for keyword in all_keywords:
+                if levenshtein_distance(word, keyword) <= Config.MAX_TYPOS_PER_WORD:
+                    meaningful_words += 1
+                    break
+    
+    return meaningful_words >= 1  # Хотя бы одно осмысленное слово
+
+def is_unclear_message(text: str) -> bool:
+    """Проверяет, является ли сообщение непонятным или содержащим опечатки"""
+    if not text or len(text.strip()) < Config.MIN_QUESTION_LENGTH:
+        return True
+    
+    # Проверяем на бессмысленный текст
+    if is_gibberish(text):
+        return True
+    
+    # Проверяем, содержит ли текст осмысленные слова
+    if not contains_meaningful_words(text):
+        return True
+    
+    return False
 
 def classify_question(question: str) -> str:
     """Классификация вопроса по категориям"""
@@ -639,6 +784,10 @@ def handle_question(db: Session, question: str, user_id: str) -> str:
         question = question.strip()
         if not question:
             return "Пожалуйста, задайте ваш вопрос о Суздале."
+        
+        # Проверяем, является ли сообщение непонятным или содержащим опечатки
+        if is_unclear_message(question):
+            return "Простите, не очень понял ваше сообщение. Пожалуйста, попробуйте сформулировать вопрос иначе. Например:\n- Какие музеи стоит посетить в Суздале?\n- Где можно поесть традиционную русскую кухню?\n- Как добраться до Суздальского кремля?"
         
         # Проверяем, является ли это ответом на уточнение
         if is_user_response_to_clarification(db, user_id, question):
