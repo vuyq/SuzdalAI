@@ -306,8 +306,42 @@ def needs_clarification(question: str) -> Tuple[bool, Optional[str]]:
     if len(question) < 3:
         return True, "Пожалуйста, уточните ваш вопрос. Например:\n- Какие музеи стоит посетить?\n- Где можно попробовать медовуху?"
     
-    # Однословные запросы
+    # Проверяем, какие параметры уже указаны
+    specified_params = {
+        'cuisine': any(word in question_lower for word in ['русск', 'итальянск', 'европейск', 'азиатск', 'китайск', 'японск']),
+        'budget': any(word in question_lower for word in ['эконом', 'дешев', 'средн', 'премиум', 'дорог']),
+        'location': any(word in question_lower for word in ['центр', 'кремл', 'окраин', 'район']),
+        'type': any(word in question_lower for word in ['кафе', 'ресторан', 'столов', 'паб', 'бар'])
+    }
+    
     words = question.split()
+    
+    # Если запрос содержит только тип кухни или только тип заведения
+    if (('итальянск' in question_lower or 'европейск' in question_lower or 
+         'русск' in question_lower or 'азиатск' in question_lower) and
+        not any(word in question_lower for word in ['бюджет', 'цена', 'стоимость', 'центр', 'район'])):
+        
+        return True, (
+            "🍝 Отлично! Теперь, пожалуйста, уточните:\n\n"
+            "• **Бюджет**: какой диапазон цен предпочитаете?\n"
+            "• **Расположение**: в центре города или не важно?\n"
+            "• **Атмосфера**: уютное кафе или ресторан для ужина?\n\n"
+            "Что для вас важнее?"
+        )
+    
+    # Если указан только тип заведения
+    if (any(word in question_lower for word in ['ресторан', 'кафе', 'столовая']) and
+        not specified_params['cuisine'] and not specified_params['budget']):
+        
+        return True, (
+            "🍽️ Хорошо! Теперь уточните:\n\n"
+            "• **Кухня**: какую кухню предпочитаете?\n"
+            "• **Бюджет**: примерный диапазон цен?\n"
+            "• **Местоположение**: где бы хотели?\n\n"
+            "Что для вас в приоритете?"
+        )
+    
+    # Однословные запросы
     if len(words) == 1:
         word = words[0].lower()
         if word in ["еда", "кафе", "ресторан"]:
@@ -316,24 +350,40 @@ def needs_clarification(question: str) -> Tuple[bool, Optional[str]]:
             return True, get_museum_clarification()
         elif word in ["достопримечательность", "посмотреть"]:
             return True, get_attraction_clarification()
-        elif word in ["отель", "гостиница"]:
-            return True, get_accommodation_clarification()
-        elif word in ["транспорт", "добраться"]:
-            return True, get_transport_clarification()
     
-    # Короткие вопросы без деталей
+    # Короткие вопросы без деталей (2-3 слова)
     if len(words) <= 3:
         question_type = classify_question(question)
+        
+        # Если уже есть некоторые параметры, уточняем недостающие
         if question_type == "food":
-            return True, get_food_clarification()
+            missing_params = []
+            if not specified_params['budget']:
+                missing_params.append("бюджет")
+            if not specified_params['location']:
+                missing_params.append("расположение")
+            if not specified_params['type']:
+                missing_params.append("тип заведения")
+            
+            if missing_params:
+                clarification = f"🍽️ Отлично! Уточните {', '.join(missing_params)}:\n\n"
+                if 'бюджет' in missing_params:
+                    clarification += "• **Бюджет**: экономный, средний, премиум?\n"
+                if 'расположение' in missing_params:
+                    clarification += "• **Расположение**: центр, рядом с достопримечательностями?\n"
+                if 'тип заведения' in missing_params:
+                    clarification += "• **Тип**: кафе, ресторан, паб?\n"
+                clarification += "\nЧто для вас важнее?"
+                return True, clarification
+            
+            # Если все параметры указаны, не нужно уточнение
+            return False, None
+        
+        # Для других категорий
         elif question_type == "museum":
             return True, get_museum_clarification()
         elif question_type == "attraction":
             return True, get_attraction_clarification()
-        elif question_type == "accommodation":
-            return True, get_accommodation_clarification()
-        elif question_type == "transport":
-            return True, get_transport_clarification()
     
     return False, None
 
@@ -391,32 +441,24 @@ def get_transport_clarification() -> str:
         "• **Экскурсии** - организованные туры\n\n"
         "Что именно вас интересует?"
     )
-
 def is_user_response_to_clarification(db: Session, user_id: str, current_question: str) -> bool:
     """Проверяет, является ли текущий вопрос ответом на уточнение"""
     last_assistant_msg = get_last_assistant_message(db, user_id)
     if not last_assistant_msg or not is_clarification_request(last_assistant_msg):
         return False
     
-    # Проверяем, что пользователь отвечает на уточнение, а не задает новый вопрос
     current_lower = current_question.lower()
     
-    # Если пользователь просто повторяет тот же короткий вопрос
-    if len(current_question.split()) <= 2 and classify_question(current_question) == classify_question(last_assistant_msg):
-        return True
+    # Проверяем, содержит ли ответ конкретные параметры
+    has_specific_answer = any([
+        any(word in current_lower for word in ['эконом', 'средн', 'премиум', 'дешёв', 'дорог']),  # бюджет
+        any(word in current_lower for word in ['центр', 'кремл', 'окраин', 'район']),  # расположение
+        any(word in current_lower for word in ['кафе', 'ресторан', 'столов', 'паб']),  # тип
+        any(word in current_lower for word in ['не важно', 'любой', 'всё равно']),  # безразличие
+        len(current_question.split()) <= 3  # короткий ответ
+    ])
     
-    # Если пользователь дает конкретный ответ на уточнение
-    clarification_patterns = [
-        r"(русск|итальянск|европейск|азиатск)[а-я]* кухн",
-        r"(эконом|средн|премиум|деш[её]в|дорог)[а-я]*",
-        r"(центр|кремл|окраин)[а-я]*",
-        r"(кафе|ресторан|столов|паб|бар)[а-я]*",
-        r"(историческ|художествен|тематическ|архитектурн)[а-я]*",
-        r"(отель|гостиниц|хостел|квартир)[а-я]*",
-        r"(москв|владимир|поезд|автобус|такси|машин)[а-я]*"
-    ]
-    
-    return any(re.search(pattern, current_lower) for pattern in clarification_patterns)
+    return has_specific_answer
 
 def generate_clarified_response(db: Session, user_id: str, clarification: str) -> str:
     """Генерация ответа на уточняющую информацию"""
