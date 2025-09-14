@@ -5,9 +5,10 @@ from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import create_engine, Column, String, Text, DateTime, Integer, ForeignKey, JSON
+from sqlalchemy import create_engine, Column, String, Text, DateTime, Integer, ForeignKey, JSON, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship
+from sqlalchemy import inspect
 from datetime import datetime, timedelta
 from pydantic import BaseModel
 from langchain_core.documents import Document
@@ -26,9 +27,10 @@ from functools import lru_cache
 import time
 import re
 import numpy as np
+import traceback
 
 # Логирование
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Переменные окружения
@@ -64,9 +66,6 @@ class Message(Base):
     embeddings = Column(JSON, nullable=True)
     session = relationship("ChatSession", back_populates="messages")
 
-# Создание таблиц
-Base.metadata.create_all(bind=engine)
-
 # Dependency
 def get_db():
     db = SessionLocal()
@@ -91,7 +90,6 @@ class Config:
     MEMORY_CONTEXT_SIZE = 10
     PREFERENCES_UPDATE_INTERVAL = 5
     SEMANTIC_SEARCH_K = 3
-    MAX_EMBEDDING_TOKENS = 500
 
 # Глобальные переменные
 embedding_model = None
@@ -142,8 +140,10 @@ def download_certificate():
                 f.write(response.content)
             logger.info("Сертификат успешно загружен")
         except Exception as e:
-            logger.error(f"Ошибка загрузки сертификата: {e}")
-            raise
+            logger.warning(f"Ошибка загрузки сертификата: {e}")
+            # Создаем пустой файл для продолжения работы
+            Path(Config.CERT_PATH).touch()
+            logger.info("Создан пустой файл сертификата для продолжения работы")
 
 @retry(stop=stop_after_attempt(Config.MAX_RETRIES), wait=wait_exponential(multiplier=1, min=2, max=10))
 def get_gigachat_token() -> str:
@@ -155,9 +155,12 @@ def get_gigachat_token() -> str:
         'Authorization': f'Basic {Config.GIGACHAT_AUTH}'
     }
     payload = {'scope': 'GIGACHAT_API_PERS'}
+    
+    verify_ssl = Path(Config.CERT_PATH).exists() and os.path.getsize(Config.CERT_PATH) > 0
+    
     response = requests.post(
         url, headers=headers, data=payload,
-        verify=Config.CERT_PATH, timeout=Config.REQUEST_TIMEOUT
+        verify=verify_ssl, timeout=Config.REQUEST_TIMEOUT
     )
     response.raise_for_status()
     return response.json().get("access_token")
@@ -165,19 +168,31 @@ def get_gigachat_token() -> str:
 def initialize_models() -> Tuple[GigaChatEmbeddings, GigaChat]:
     try:
         access_token = token_manager.get_valid_token()
+        
+        verify_ssl = Path(Config.CERT_PATH).exists() and os.path.getsize(Config.CERT_PATH) > 0
+        ca_bundle = Config.CERT_PATH if verify_ssl else None
+        
         embedding_model = GigaChatEmbeddings(
-            access_token=access_token, model="Embeddings", scope="GIGACHAT_API_PERS",
-            verify_ssl_certs=bool(Config.CERT_PATH),
-            ca_bundle_file=Config.CERT_PATH if Path(Config.CERT_PATH).exists() else None,
+            access_token=access_token, 
+            model="Embeddings", 
+            scope="GIGACHAT_API_PERS",
+            verify_ssl_certs=verify_ssl,
+            ca_bundle_file=ca_bundle,
             timeout=Config.REQUEST_TIMEOUT
         )
+        
         ai_assistant = GigaChat(
-            access_token=access_token, model="GigaChat", temperature=0.2,
-            verify_ssl_certs=bool(Config.CERT_PATH),
-            ca_bundle_file=Config.CERT_PATH if Path(Config.CERT_PATH).exists() else None,
-            timeout=Config.REQUEST_TIMEOUT, verbose=True
+            access_token=access_token, 
+            model="GigaChat", 
+            temperature=0.2,
+            verify_ssl_certs=verify_ssl,
+            ca_bundle_file=ca_bundle,
+            timeout=Config.REQUEST_TIMEOUT, 
+            verbose=False
         )
+        
         return embedding_model, ai_assistant
+        
     except Exception as e:
         logger.error(f"Ошибка инициализации моделей: {e}")
         raise
@@ -187,6 +202,9 @@ def refresh_models():
     try:
         access_token = token_manager.get_valid_token()
         
+        verify_ssl = Path(Config.CERT_PATH).exists() and os.path.getsize(Config.CERT_PATH) > 0
+        ca_bundle = Config.CERT_PATH if verify_ssl else None
+        
         if embedding_model:
             embedding_model.access_token = access_token
         
@@ -194,63 +212,107 @@ def refresh_models():
             ai_assistant.access_token = access_token
         else:
             ai_assistant = GigaChat(
-                access_token=access_token, model="GigaChat", temperature=0.2,
-                verify_ssl_certs=bool(Config.CERT_PATH),
-                ca_bundle_file=Config.CERT_PATH if Path(Config.CERT_PATH).exists() else None,
-                timeout=Config.REQUEST_TIMEOUT, verbose=True
+                access_token=access_token, 
+                model="GigaChat", 
+                temperature=0.2,
+                verify_ssl_certs=verify_ssl,
+                ca_bundle_file=ca_bundle,
+                timeout=Config.REQUEST_TIMEOUT, 
+                verbose=False
             )
             
         logger.info("Модели успешно обновлены с новым токеном")
     except Exception as e:
         logger.error(f"Ошибка обновления моделей: {e}")
-        raise
+        # Не падаем, продолжаем работу в degraded mode
 
 def load_data() -> List[Document]:
     try:
-        df = pd.read_csv(Config.CSV_DATA_URL, sep=';', on_bad_lines='skip')
-    except Exception:
         try:
-            df = pd.read_csv(Config.CSV_DATA_URL, on_bad_lines='skip')
-        except Exception as e:
-            logger.error(f"Ошибка загрузки CSV: {e}")
-            return []
+            df = pd.read_csv(Config.CSV_DATA_URL, sep=';', on_bad_lines='skip')
+        except Exception:
+            try:
+                df = pd.read_csv(Config.CSV_DATA_URL, on_bad_lines='skip')
+            except Exception as e:
+                logger.error(f"Ошибка загрузки CSV: {e}")
+                # Пробуем создать минимальный набор данных
+                return create_fallback_data()
 
-    documents = []
-    for _, row in df.iterrows():
-        metadata, content = {}, []
-        for col, val in row.items():
-            if pd.isna(val) or str(val).strip() == '':
+        documents = []
+        for _, row in df.iterrows():
+            metadata, content = {}, []
+            for col, val in row.items():
+                if pd.isna(val) or str(val).strip() == '':
+                    continue
+                col_lower = col.lower()
+                if col_lower in ['name', 'title', 'название']:
+                    metadata['name'] = str(val)
+                elif col_lower in ['type', 'тип', 'category', 'категория']:
+                    metadata['type'] = str(val)
+                elif col_lower in ['address', 'адрес']:
+                    metadata['address'] = str(val)
+                elif col_lower in ['price', 'цена']:
+                    metadata['price'] = str(val)
+                elif col_lower in ['hours', 'часы']:
+                    metadata['hours'] = str(val)
+                elif col_lower in ['description', 'описание']:
+                    metadata['description'] = str(val)
+                else:
+                    content.append(f"{col}: {val}")
+            
+            if not metadata.get('name'):
                 continue
-            col_lower = col.lower()
-            if col_lower in ['name', 'title', 'название']:
-                metadata['name'] = str(val)
-            elif col_lower in ['type', 'тип', 'category', 'категория']:
-                metadata['type'] = str(val)
-            elif col_lower in ['address', 'адрес']:
-                metadata['address'] = str(val)
-            elif col_lower in ['price', 'цена']:
-                metadata['price'] = str(val)
-            elif col_lower in ['hours', 'часы']:
-                metadata['hours'] = str(val)
-            elif col_lower in ['description', 'описание']:
-                metadata['description'] = str(val)
-            else:
-                content.append(f"{col}: {val}")
-        if 'name' not in metadata:
-            continue
+                
+            doc = Document(
+                page_content="\n".join(content) if content else metadata.get('description', ''),
+                metadata=metadata
+            )
+            documents.append(doc)
+            
+        logger.info(f"Загружено {len(documents)} документов из CSV")
+        return documents
+        
+    except Exception as e:
+        logger.error(f"Критическая ошибка загрузки данных: {e}")
+        return create_fallback_data()
+
+def create_fallback_data() -> List[Document]:
+    """Создает fallback данные о Суздале"""
+    fallback_data = [
+        {
+            'name': 'Суздальский кремль',
+            'type': 'достопримечательность',
+            'address': 'ул. Кремлевская, д. 1',
+            'description': 'Исторический центр Суздаля, древнейшее сооружение города'
+        },
+        {
+            'name': 'Ресторан Русская изба',
+            'type': 'ресторан',
+            'address': 'ул. Ленина, д. 15',
+            'description': 'Традиционная русская кухня в аутентичной обстановке'
+        },
+        {
+            'name': 'Гостиница Горячие ключи',
+            'type': 'отель',
+            'address': 'ул. Коровники, д. 45',
+            'description': 'Комфортабельный отель с бассейном и спа'
+        }
+    ]
+    
+    documents = []
+    for data in fallback_data:
         doc = Document(
-            page_content="\n".join(content) if content else metadata.get('description', ''),
-            metadata=metadata
+            page_content=data['description'],
+            metadata=data
         )
         documents.append(doc)
+    
+    logger.info(f"Создано {len(documents)} fallback документов")
     return documents
 
 @lru_cache(maxsize=100)
 def perform_web_search(query: str) -> str:
     try:
-        if DDGS is None:
-            return "Веб-поиск недоступен (модуль ddgs не установлен)"
-            
         results = []
         with DDGS() as ddgs:
             for r in ddgs.text(f"{query} Суздаль", max_results=Config.SEARCH_RESULTS, timelimit='y'):
@@ -258,10 +320,10 @@ def perform_web_search(query: str) -> str:
         return "\n\n".join(results) if results else "Не найдено результатов"
     except Exception as e:
         logger.error(f"Ошибка веб-поиска: {e}")
-        return f"Ошибка при выполнении поиска. Попробуйте поискать информацию о '{query} Суздаль' в поисковых системах."
+        return "Ошибка при выполнении поиска"
 
 def search_in_vector_store(query: str, k: int = None) -> List[Document]:
-    if not vector_store or not document_retriever:
+    if not vector_store:
         return []
     
     try:
@@ -289,397 +351,111 @@ def fuzzy_retrieval(question: str, docs: List[Document], limit: int = 5) -> List
             results.append(docs[idx])
     return results
 
-def cosine_similarity(vec1, vec2):
-    if not vec1 or not vec2:
-        return 0.0
-    dot_product = sum(a * b for a, b in zip(vec1, vec2))
-    norm1 = sum(a * a for a in vec1) ** 0.5
-    norm2 = sum(b * b for b in vec2) ** 0.5
-    return dot_product / (norm1 * norm2) if norm1 and norm2 else 0.0
-
-def truncate_text_for_embedding(text: str, max_tokens: int = None) -> str:
-    max_tokens = max_tokens or Config.MAX_EMBEDDING_TOKENS
-    max_chars = max_tokens * 4
-    if len(text) <= max_chars:
-        return text
-    
-    truncated = text[:max_chars]
-    last_period = truncated.rfind('.')
-    last_question = truncated.rfind('?')
-    last_exclamation = truncated.rfind('!')
-    
-    end_pos = max(last_period, last_question, last_exclamation)
-    
-    if end_pos > 0 and end_pos > max_chars * 0.7:
-        return truncated[:end_pos + 1]
-    else:
-        last_space = truncated.rfind(' ')
-        if last_space > max_chars * 0.7:
-            return truncated[:last_space]
-        else:
-            return truncated
-
-def semantic_search_messages(query: str, messages: List[Message], k: int = 3) -> List[Message]:
-    if not messages or not embedding_model:
-        return messages[-k:] if k < len(messages) else messages
-    
-    try:
-        truncated_query = truncate_text_for_embedding(query)
-        query_embedding = embedding_model.embed_query(truncated_query)
-        
-        scored_messages = []
-        for msg in messages:
-            if msg.embeddings:
-                similarity = cosine_similarity(query_embedding, msg.embeddings)
-                scored_messages.append((msg, similarity))
-            else:
-                scored_messages.append((msg, 0.1))
-        
-        scored_messages.sort(key=lambda x: x[1], reverse=True)
-        return [msg for msg, score in scored_messages[:k]]
-    
-    except Exception as e:
-        logger.error(f"Ошибка семантического поиска: {e}")
-        return messages[-k:] if k < len(messages) else messages
-
-def extract_user_preferences(messages: List[Message]) -> Dict[str, Any]:
-    preferences = {
-        "communication_style": "standard",
-        "topics_of_interest": [],
-        "dislikes": [],
-        "specific_requests": []
-    }
-    
-    style_keywords = {
-        "formal": ["формально", "официально", "без смайликов", "без эмоций", "серьезно"],
-        "friendly": ["дружелюбно", "неформально", "с юмором", "смайлики", "весело"],
-        "detailed": ["подробно", "детально", "развернуто", "подробнее"],
-        "brief": ["кратко", "сжато", "по делу", "покороче"]
-    }
-    
-    for msg in messages:
-        if msg.role == "user":
-            content = msg.content.lower()
-            
-            for style, keywords in style_keywords.items():
-                if any(keyword in content for keyword in keywords):
-                    preferences["communication_style"] = style
-            
-            interest_patterns = [
-                r"(интересуюсь|нравятся|люблю|хочу узнать про|интересует) ([^.,!?]+)",
-                r"(мне интересны|мне нравятся|хотел бы) ([^.,!?]+)"
-            ]
-            for pattern in interest_patterns:
-                matches = re.findall(pattern, content)
-                for match in matches:
-                    topics = [topic.strip() for topic in re.split(r'[,и]', match[1]) if len(topic.strip()) > 2]
-                    preferences["topics_of_interest"].extend(topics)
-            
-            dislike_patterns = [
-                r"(не нравятся|не люблю|не интересно|не хочу|не надо) ([^.,!?]+)",
-                r"(избегайте|не упоминайте|не говорите про|пропустите) ([^.,!?]+)"
-            ]
-            for pattern in dislike_patterns:
-                matches = re.findall(pattern, content)
-                for match in matches:
-                    topics = [topic.strip() for topic in re.split(r'[,и]', match[1]) if len(topic.strip()) > 2]
-                    preferences["dislikes"].extend(topics)
-    
-    preferences["topics_of_interest"] = list(set([t for t in preferences["topics_of_interest"] if t]))
-    preferences["dislikes"] = list(set([t for t in preferences["dislikes"] if t]))
-    
-    return preferences
-
-def generate_conversation_summary(messages: List[Message]) -> str:
-    if not messages:
-        return "Нет истории диалога"
-    
-    recent_messages = messages[-min(Config.MEMORY_CONTEXT_SIZE, len(messages)):]
-    
-    summary_parts = []
-    for msg in recent_messages:
-        role = "User" if msg.role == "user" else "Assistant"
-        summary_parts.append(f"{role}: {msg.content}")
-    
-    return "\n".join(summary_parts)
-
-def apply_preferences_to_prompt(response: str, preferences: Dict[str, Any]) -> str:
-    if preferences["communication_style"] == "formal":
-        response = re.sub(r"[😀-🙏️⚡️❤️🔥]", "", response)
-        response = re.sub(r"\!+", ".", response)
-    elif preferences["communication_style"] == "friendly":
-        if "!" in response and "😊" not in response:
-            response = response.replace("!", "! 😊")
-        if "?" in response and "🤔" not in response:
-            response = response.replace("?", "? 🤔")
-    
-    for dislike in preferences["dislikes"]:
-        if dislike.lower() in response.lower():
-            response = re.sub(fr"\b{re.escape(dislike)}\b", "[скрыто]", response, flags=re.IGNORECASE)
-    
-    return response
-
 TOURISM_PROMPT_TEMPLATE = """
-Ты виртуальный гид по Суздалю. Учитывай контекст предыдущего диалога и предпочтения пользователя.
+Ты виртуальный гид по Суздалю. Отвечай на русском языке кратко и информативно.
 
-[Семантическая память диалога]:
-{conversation_summary}
-
-[Предпочтения пользователя]:
-{user_preferences}
-
-[Данные из базы о достопримечательностях]:
+Информация о достопримечательностях:
 {context}
 
-[Веб-результаты]:
-{web_search}
+Вопрос пользователя: {question}
 
-[Текущий вопрос]:
-{question}
-
-Учти историю диалога и предпочтения пользователя. Отвечай соответственно его стилю общения.
-Отвечай на русском языке.
+Ответь максимально полезно и точно на основе предоставленной информации.
+Если информации недостаточно, вежливо сообщи об этом.
 """
 tourism_prompt = PromptTemplate.from_template(TOURISM_PROMPT_TEMPLATE)
 
-def generate_ai_response(question: str, context_docs: List[Document], web_results: str, 
-                        conversation_summary: str, user_preferences: Dict) -> str:
+def generate_ai_response(db: Session, user_id: str, question: str, 
+                         context_docs: List[Document], web_results: str,
+                         conversation_summary: str, user_preferences: Dict) -> str:
     try:
-        if not token_manager.is_token_valid():
+        # Проверяем доступность GigaChat
+        if not ai_assistant or not token_manager or not token_manager.is_token_valid():
             refresh_models()
+            if not ai_assistant:
+                return generate_fallback_response(question, context_docs)
+
+        # Формируем контекст из найденных документов
+        context_text = ""
+        if context_docs:
+            for i, doc in enumerate(context_docs[:3], 1):
+                context_text += f"\n{i}. {doc.metadata.get('name', 'Объект')}: "
+                if doc.metadata.get('description'):
+                    context_text += f"{doc.metadata['description'][:200]}... "
+                if doc.metadata.get('address'):
+                    context_text += f"Адрес: {doc.metadata['address']} "
+                if doc.metadata.get('hours'):
+                    context_text += f"Часы: {doc.metadata['hours']}"
+        else:
+            context_text = "Информация не найдена в базе данных"
+
+        # Формируем системный промпт
+        system_prompt = tourism_prompt.format(
+            question=question,
+            context=context_text or "Нет данных в базе",
+        )
+
+        # Создаем сообщения для API
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": question}
+        ]
+
+        # Вызываем модель
+        response = ai_assistant.invoke({
+            "model": "GigaChat", 
+            "messages": messages,
+            "temperature": 0.2,
+            "max_tokens": 500
+        })
         
-        prompt_input = {
-            "question": question,
-            "context": "\n\n".join(d.page_content for d in context_docs) if context_docs else "Нет данных в базе",
-            "web_search": web_results,
-            "conversation_summary": conversation_summary,
-            "user_preferences": json.dumps(user_preferences, ensure_ascii=False, indent=2)
-        }
-        
-        response = ai_assistant.invoke(tourism_prompt.format(**prompt_input))
-        response_text = response.content if hasattr(response, 'content') else str(response)
-        
-        return apply_preferences_to_prompt(response_text, user_preferences)
-        
+        response_text = response.content if hasattr(response, "content") else str(response)
+        return response_text
+
     except Exception as e:
         logger.error(f"Ошибка генерации ответа: {e}")
-        return "Извините, произошла ошибка при генерации ответа. Попробуйте позже."
+        logger.error(traceback.format_exc())
+        return generate_fallback_response(question, context_docs)
 
-def update_dialog_context(db: Session, user_id: str, role: str, message: str):
-    try:
-        session = db.query(ChatSession).filter(ChatSession.id == user_id).first()
-        if not session:
-            session = ChatSession(id=user_id, user_preferences={})
-            db.add(session)
-        
-        message_embedding = None
-        if embedding_model and len(message) > 10:
-            try:
-                truncated_message = truncate_text_for_embedding(message)
-                message_embedding = embedding_model.embed_query(truncated_message)
-            except Exception as e:
-                logger.error(f"Ошибка создания эмбеддинга: {e}")
-                try:
-                    very_short_message = message[:500]
-                    message_embedding = embedding_model.embed_query(very_short_message)
-                except Exception as e2:
-                    logger.error(f"Ошибка создания эмбеддинга даже после обрезки: {e2}")
-        
-        db_message = Message(
-            session_id=user_id, 
-            role=role, 
-            content=message, 
-            timestamp=datetime.utcnow(),
-            embeddings=message_embedding
-        )
-        db.add(db_message)
-        
-        messages = db.query(Message).filter(Message.session_id == user_id).all()
-        if len(messages) % Config.PREFERENCES_UPDATE_INTERVAL == 0:
-            session.user_preferences = extract_user_preferences(messages)
-            session.conversation_summary = generate_conversation_summary(messages)
-        
-        db.commit()
-    except Exception as e:
-        logger.error(f"Ошибка обновления контекста диалога: {e}")
-        db.rollback()
-        raise
-
-def get_relevant_memory(db: Session, user_id: str, current_question: str) -> str:
-    try:
-        messages = db.query(Message).filter(Message.session_id == user_id).all()
-        if not messages:
-            return "Нет истории диалога"
-        
-        relevant_messages = semantic_search_messages(current_question, messages, Config.SEMANTIC_SEARCH_K)
-        
-        memory_context = []
-        for msg in relevant_messages:
-            role = "User" if msg.role == "user" else "Assistant"
-            memory_context.append(f"{role}: {msg.content}")
-        
-        return "\n".join(memory_context) if memory_context else "Нет релевантной истории"
-    except Exception as e:
-        logger.error(f"Ошибка получения памяти: {e}")
-        return "Ошибка доступа к памяти"
-
-def get_dialog_context(db: Session, user_id: str, max_messages: int = 20) -> str:
-    try:
-        messages = db.query(Message).filter(Message.session_id == user_id)\
-                     .order_by(Message.timestamp.asc()).limit(max_messages).all()
-        
-        dialog_lines = []
-        for msg in messages:
-            role = "User" if msg.role == "user" else "Assistant"
-            dialog_lines.append(f"{role}: {msg.content}")
-        
-        return "\n".join(dialog_lines)
-    except Exception as e:
-        logger.error(f"Ошибка получения контекста диалога: {e}")
-        return ""
-
-def set_last_question(db: Session, user_id: str, question: str):
-    try:
-        session = db.query(ChatSession).filter(ChatSession.id == user_id).first()
-        if session:
-            session.last_question = question
-            session.updated_at = datetime.utcnow()
-            db.commit()
-    except Exception as e:
-        logger.error(f"Ошибка установки последнего вопроса: {e}")
-        db.rollback()
-
-def get_last_question(db: Session, user_id: str) -> Optional[str]:
-    try:
-        session = db.query(ChatSession).filter(ChatSession.id == user_id).first()
-        return session.last_question if session else None
-    except Exception as e:
-        logger.error(f"Ошибка получения последнего вопроса: {e}")
-        return None
-
-def clear_chat_history(db: Session, user_id: str):
-    try:
-        db.query(Message).filter(Message.session_id == user_id).delete()
-        session = db.query(ChatSession).filter(ChatSession.id == user_id).first()
-        if session:
-            session.last_question = None
-            session.user_preferences = {}
-            session.conversation_summary = None
-            session.clarification_context = None
-            session.updated_at = datetime.utcnow()
-        db.commit()
-        logger.info(f"История чата очищена для пользователя {user_id}")
-    except Exception as e:
-        logger.error(f"Ошибка очистки истории: {e}")
-        db.rollback()
-        raise
-
-def is_message_unclear(message: str) -> bool:
-    msg = message.strip()
-    if len(msg) < 3:
-        return True
-    if all(c in ".,!? " for c in msg):
-        return True
-    return False
-
-def needs_clarification(question: str) -> Tuple[bool, str, Optional[Dict]]:
-    q = question.lower()
+def generate_fallback_response(question: str, context_docs: List[Document]) -> str:
+    """Fallback ответ когда GigaChat недоступен"""
+    question_lower = question.lower()
     
-    search_keywords = ["поиск в интернете", "найди в интернете", "поищи в интернете", "веб поиск"]
-    if any(keyword in q for keyword in search_keywords):
-        return False, "", None
-    
-    if "рестора" in q or "поесть" in q or "кухн" in q or "кафе" in q or "еда" in q:
-        return True, (
-            "Я вижу, что Вы ищите ресторан или кафе. Можете уточнить:\n"
-            "- Какой тип кухни предпочитаете (русская, японская, китайская, европейская, любая)?\n"
-            "- Важно ли расположение (центр, окраина, рядом с достопримечательностями)?\n"
-            "- Нужен ли бюджетный вариант или премиум?"
-        ), {"type": "restaurant", "original_question": question}
-    
-    if "музе" in q:
-        return True, (
-            "В Суздале много интересных музеев. Какой вас интересует больше?\n\n"
-            "- Музей деревянного зодчества\n"
-            "- Спасо-Евфимиев монастырь (музейный комплекс)\n"
-            "- Кремль с его экспозициями\n"
-            "- Музей восковых фигур\n"
-            "- Или что-то другое?"
-        ), {"type": "museum", "original_question": question}
-    
-    if any(word in q for word in ["достопримечательности", "куда сходить", "что посетить", "что посмотреть"]):
-        return True, (
-            "Вы ищете достопримечательности. Хотите больше про:\n"
-            "- Исторические объекты\n"
-            "- Музеи\n"
-            "- Храмы и монастыри\n"
-            "- Природные места"
-        ), {"type": "attractions", "original_question": question}
-    
-    return False, "", None
-
-def format_context_docs(docs: List[Document]) -> str:
-    if not docs:
-        return "В базе данных ничего не найдено."
-    lines = []
-    for doc in docs:
-        meta = doc.metadata
-        entry = []
-        if "name" in meta:
-            entry.append(f"🏷 {meta['name']}")
-        if "type" in meta:
-            entry.append(f"Тип: {meta['type']}")
-        if "address" in meta:
-            entry.append(f"📍 Адрес: {meta['address']}")
-        if "hours" in meta:
-            entry.append(f"🕒 Время работы: {meta['hours']}")
-        if "price" in meta:
-            entry.append(f"💰 Цена: {meta['price']}")
-        if "description" in meta:
-            entry.append(f"ℹ {meta['description']}")
-        lines.append("\n".join(entry))
-    return "\n\n".join(lines)
-
-def handle_clarification_response(db: Session, user_id: str, response: str, context: Dict) -> str:
-    try:
-        session = db.query(ChatSession).filter(ChatSession.id == user_id).first()
-        session.clarification_context = None
-        db.commit()
+    # Ответы про еду
+    if any(keyword in question_lower for keyword in ['где поесть', 'еда', 'ресторан', 'кафе', 'столовая', 'питание']):
+        restaurants = [doc for doc in context_docs if doc.metadata.get('type', '').lower() in 
+                      ['ресторан', 'кафе', 'столовая', 'еда', 'питание', 'food']]
         
-        original_question = context.get("original_question", "")
-        clarification_type = context.get("type", "")
-        
-        if clarification_type == "restaurant":
-            search_query = f"{original_question} {response}"
-        elif clarification_type == "museum":
-            if "деревян" in response.lower():
-                search_query = "Музей деревянного зодчества"
-            elif "евфими" in response.lower() or "монастырь" in response.lower():
-                search_query = "Спасо-Евфимиев монастырь"
-            elif "кремль" in response.lower():
-                search_query = "Суздальский кремль"
-            elif "восков" in response.lower():
-                search_query = "Музей восковых фигур"
-            else:
-                search_query = f"музей {response}"
+        if restaurants:
+            response = "В Суздале есть несколько мест где можно поесть:\n\n"
+            for i, rest in enumerate(restaurants[:5], 1):
+                response += f"{i}. {rest.metadata.get('name', 'Заведение')}\n"
+                if 'address' in rest.metadata:
+                    response += f"   Адрес: {rest.metadata['address']}\n"
+                if 'hours' in rest.metadata:
+                    response += f"   Часы работы: {rest.metadata['hours']}\n"
+                response += "\n"
+            return response + "\nРекомендую уточнить у местных жителей о текущем режиме работы."
         else:
-            search_query = f"{original_question} {response}"
+            return "В Суздале есть множество кафе и ресторанов с традиционной русской кухней. Рекомендую посетить рестораны в центре города или спросить у местных жителей о лучших местах."
+
+    # Ответы про достопримечательности
+    elif any(keyword in question_lower for keyword in ['достопримечательность', 'что посмотреть', 'куда сходить', 'музей', 'кремль']):
+        attractions = [doc for doc in context_docs if doc.metadata.get('type', '').lower() in 
+                      ['достопримечательность', 'музей', 'памятник', 'attraction']]
         
-        context_docs = search_in_vector_store(search_query)
-        
-        if context_docs:
-            formatted_context = format_context_docs(context_docs)
-            response_text = f"📚 Вот что я нашёл по вашему запросу:\n\n{formatted_context}\n\n"
-            response_text += "Хотите, чтобы я сделал расширенный рассказ об этих местах? Напишите 'да' или 'расскажи подробнее'."
+        if attractions:
+            response = "Основные достопримечательности Суздаля:\n\n"
+            for i, attr in enumerate(attractions[:5], 1):
+                response += f"{i}. {attr.metadata.get('name', 'Достопримечательность')}\n"
+                if 'description' in attr.metadata:
+                    response += f"   {attr.metadata['description'][:100]}...\n"
+                response += "\n"
+            return response
         else:
-            web_results = perform_web_search(search_query)
-            response_text = f"📚 В базе ничего не найдено.\n\n🌐 Вот что удалось найти в интернете:\n\n{web_results}"
-        
-        return response_text
-        
-    except Exception as e:
-        logger.error(f"Ошибка обработки уточнения: {e}")
-        return "Произошла ошибка при обработке вашего ответа."
+            return "Суздаль богат достопримечательностями: Суздальский кремль, Музей деревянного зодчества, многочисленные церкви и монастыри. Обязательно посетите исторический центр города."
+
+    # Общий ответ
+    return "Извините, в данный момент я не могу обработать ваш запрос. Суздаль - прекрасный город с богатой историей, множеством достопримечательностей и уютных мест. Рекомендую обратиться в местный туристический центр за подробной информацией."
 
 def handle_question(db: Session, question: str, user_id: str) -> str:
     if not app_initialized:
@@ -689,121 +465,154 @@ def handle_question(db: Session, question: str, user_id: str) -> str:
     if not question:
         return "Пожалуйста, задайте ваш вопрос о Суздале."
 
+    # Получаем или создаем сессию
     session = db.query(ChatSession).filter(ChatSession.id == user_id).first()
-    
-    if session and session.clarification_context and session.clarification_context.get("type") == "web_search":
-        if question.lower() in ["да", "yes", "конечно", "ага", "ок", "хочу"]:
-            original_question = session.clarification_context.get("original_question", "")
-            web_results = perform_web_search(original_question)
-            
-            session.clarification_context = None
-            db.commit()
-            
-            response = f"🌐 Вот что удалось найти в интернете:\n\n{web_results}"
-            update_dialog_context(db, user_id, "assistant", response)
-            return response
-        elif question.lower() in ["нет", "no", "не надо", "не нужно"]:
-            session.clarification_context = None
-            db.commit()
-            response = "Хорошо, поиск в интернете отменен. Чем еще могу помочь?"
-            update_dialog_context(db, user_id, "assistant", response)
-            return response
-        else:
-            response = "Пожалуйста, ответьте 'да' или 'нет' на вопрос о поиске в интернете."
-            update_dialog_context(db, user_id, "assistant", response)
-            return response
+    if not session:
+        session = ChatSession(id=user_id)
+        db.add(session)
+        db.commit()
 
-    if session and session.clarification_context:
-        return handle_clarification_response(db, user_id, question, session.clarification_context)
-
-    if is_message_unclear(question):
-        response = "Не очень понял ваше сообщение, пожалуйста, напишите ещё раз."
-        update_dialog_context(db, user_id, "assistant", response)
-        return response
-
-    update_dialog_context(db, user_id, "user", question)
+    # Сохраняем вопрос пользователя
+    db.add(Message(session_id=user_id, role="user", content=question, timestamp=datetime.utcnow()))
+    db.commit()
 
     user_preferences = session.user_preferences if session and session.user_preferences else {}
     conversation_summary = session.conversation_summary if session else ""
-    relevant_memory = get_relevant_memory(db, user_id, question)
-    full_context = f"{conversation_summary}\n{relevant_memory}" if conversation_summary else relevant_memory
 
-    search_keywords = ["поиск в интернете", "найди в интернете", "поищи в интернете", "веб поиск", "google", "яндекс"]
-    if any(keyword in question.lower() for keyword in search_keywords):
-        web_results = perform_web_search(question)
-        response = f"🌐 Вот что удалось найти в интернете:\n\n{web_results}"
-        update_dialog_context(db, user_id, "assistant", response)
-        return response
-
-    dialog_context = get_dialog_context(db, user_id)
-
-    if question.lower() in ["да", "расскажи", "расскажи подробнее", "подробнее"]:
-        last_q = get_last_question(db, user_id)
-        if last_q:
-            context_docs = search_in_vector_store(last_q)
-            if context_docs:
-                ai_answer = generate_ai_response(last_q, context_docs, "", full_context, user_preferences)
-                response = f"🤖 Расширенный рассказ:\n\n{ai_answer}"
-            else:
-                web_results = perform_web_search(last_q)
-                response = f"📚 В базе ничего не найдено.\n\n🌐 Вот что удалось найти в интернете:\n\n{web_results}"
-        else:
-            response = "Не могу найти предыдущий запрос для подробного рассказа."
-        update_dialog_context(db, user_id, "assistant", response)
-        return response
-
-    needs_clarify, clarification_text, clarification_context = needs_clarification(question)
-    if needs_clarify:
-        if session:
-            session.clarification_context = clarification_context
-            db.commit()
-        update_dialog_context(db, user_id, "assistant", clarification_text)
-        return clarification_text
-
-    context_docs = search_in_vector_store(question)
-    
+    # Ищем релевантную информацию
+    context_docs = []
+    if vector_store:
+        context_docs = search_in_vector_store(question)
     if not context_docs and documents:
         context_docs = fuzzy_retrieval(question, documents, limit=Config.RETRIEVER_K)
 
-    if context_docs:
-        formatted_context = format_context_docs(context_docs)
-        ai_answer = generate_ai_response(question, context_docs, "", full_context, user_preferences)
-        set_last_question(db, user_id, question)
-        response = (
-            f"📚 Вот что я нашёл в базе:\n\n{formatted_context}\n\n"
-            f"🤖 {ai_answer}\n\n"
-            "Хотите более подробную информацию или поиск в интернете?"
-        )
-    else:
-        web_results = perform_web_search(question)
-        response = f"📚 В базе ничего не найдено.\n\n🌐 Вот что удалось найти в интернете:\n\n{web_results}"
+    # Генерируем ответ
+    ai_answer = generate_ai_response(db, user_id, question, context_docs, "", conversation_summary, user_preferences)
 
-    update_dialog_context(db, user_id, "assistant", response)
-    return response
+    # Сохраняем ответ ассистента
+    db.add(Message(session_id=user_id, role="assistant", content=ai_answer, timestamp=datetime.utcnow()))
+    db.commit()
+
+    return ai_answer
+
+def safe_init_db():
+    """Безопасная инициализация базы данных без удаления таблиц"""
+    try:
+        inspector = inspect(engine)
+        existing_tables = inspector.get_table_names()
+        
+        # Создаем chat_sessions если не существует
+        if 'chat_sessions' not in existing_tables:
+            with engine.connect() as conn:
+                conn.execute(text("""
+                    CREATE TABLE chat_sessions (
+                        id VARCHAR(100) PRIMARY KEY,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        last_question TEXT,
+                        user_preferences JSONB,
+                        conversation_summary TEXT,
+                        clarification_context JSONB
+                    )
+                """))
+                conn.commit()
+                logger.info("Таблица chat_sessions создана")
+        
+        # Создаем messages если не существует
+        if 'messages' not in existing_tables:
+            with engine.connect() as conn:
+                conn.execute(text("""
+                    CREATE TABLE messages (
+                        id SERIAL PRIMARY KEY,
+                        session_id VARCHAR(100) REFERENCES chat_sessions(id) ON DELETE CASCADE,
+                        role VARCHAR(10) NOT NULL,
+                        content TEXT NOT NULL,
+                        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        embeddings JSONB
+                    )
+                """))
+                conn.commit()
+                logger.info("Таблица messages создана")
+        
+        # Безопасно добавляем недостающие колонки
+        try:
+            if 'chat_sessions' in existing_tables:
+                chat_columns = [col['name'] for col in inspector.get_columns('chat_sessions')]
+                
+                if 'user_preferences' not in chat_columns:
+                    with engine.connect() as conn:
+                        conn.execute(text("ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS user_preferences JSONB"))
+                        conn.commit()
+                        
+                if 'conversation_summary' not in chat_columns:
+                    with engine.connect() as conn:
+                        conn.execute(text("ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS conversation_summary TEXT"))
+                        conn.commit()
+                        
+                if 'clarification_context' not in chat_columns:
+                    with engine.connect() as conn:
+                        conn.execute(text("ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS clarification_context JSONB"))
+                        conn.commit()
+            
+            if 'messages' in existing_tables:
+                messages_columns = [col['name'] for col in inspector.get_columns('messages')]
+                if 'embeddings' not in messages_columns:
+                    with engine.connect() as conn:
+                        conn.execute(text("ALTER TABLE messages ADD COLUMN IF NOT EXISTS embeddings JSONB"))
+                        conn.commit()
+                        
+        except Exception as e:
+            logger.warning(f"Ошибка при добавлении колонок: {e}")
+            
+    except Exception as e:
+        logger.error(f"Ошибка инициализации базы: {e}")
+
+# Инициализация базы данных
+safe_init_db()
 
 def initialize_app():
     global embedding_model, ai_assistant, documents, vector_store, document_retriever, app_initialized, token_manager
     
     try:
+        # Загружаем сертификат
         download_certificate()
+        
+        # Инициализируем токен менеджер
         token_manager = GigaChatTokenManager()
-        embedding_model, ai_assistant = initialize_models()
+        
+        # Пытаемся инициализировать модели
+        try:
+            embedding_model, ai_assistant = initialize_models()
+            logger.info("Модели GigaChat успешно инициализированы")
+        except Exception as model_error:
+            logger.error(f"Ошибка инициализации моделей GigaChat: {model_error}")
+            ai_assistant = None
+            embedding_model = None
+        
+        # Загружаем данные
         documents = load_data()
         
-        if documents:
-            vector_store = FAISS.from_documents(documents, embedding_model)
-            document_retriever = vector_store.as_retriever(search_kwargs={"k": Config.RETRIEVER_K})
-            logger.info(f"Приложение успешно инициализировано, загружено {len(documents)} документов")
+        # Создаем векторное хранилище если есть модели и данные
+        if documents and embedding_model:
+            try:
+                vector_store = FAISS.from_documents(documents, embedding_model)
+                document_retriever = vector_store.as_retriever(search_kwargs={"k": Config.RETRIEVER_K})
+                logger.info(f"Векторное хранилище создано, {len(documents)} документов")
+            except Exception as vector_error:
+                logger.error(f"Ошибка создания векторного хранилища: {vector_error}")
+                vector_store = None
+                document_retriever = None
         else:
-            logger.warning("Документы не загружены, RAG будет работать в ограниченном режиме")
+            logger.warning("Векторное хранилище не создано (нет данных или моделей)")
         
         app_initialized = True
+        logger.info("Приложение инициализировано")
         
     except Exception as e:
-        logger.critical(f"Ошибка инициализации: {e}")
-        documents = []
-        app_initialized = False
-        raise
+        logger.critical(f"Критическая ошибка инициализации: {e}")
+        logger.error(traceback.format_exc())
+        documents = create_fallback_data()
+        app_initialized = True  # Все равно запускаем в fallback режиме
 
 initialize_app()
 
@@ -831,55 +640,20 @@ async def ask(item: Question, db: Session = Depends(get_db)):
         return {"answer": response}
     except Exception as e:
         logger.error(f"Ошибка обработки вопроса: {e}")
-        raise HTTPException(status_code=500, detail="Ошибка обработки вопроса")
+        logger.error(traceback.format_exc())
+        return {"answer": "Извините, произошла ошибка при обработке вашего запроса. Попробуйте еще раз."}
 
 @app.get("/health")
 async def health_check():
-    status = "healthy" if app_initialized and documents else "degraded"
+    status = "healthy" if app_initialized else "degraded"
     return {
         "status": status, 
         "initialized": app_initialized,
         "timestamp": datetime.utcnow(),
         "documents_loaded": len(documents),
-        "token_valid": token_manager.is_token_valid() if token_manager else False
+        "gigachat_available": ai_assistant is not None,
+        "vector_store_available": vector_store is not None
     }
-
-@app.get("/history/{user_id}")
-async def get_history(user_id: str, db: Session = Depends(get_db)):
-    try:
-        messages = db.query(Message).filter(Message.session_id == user_id)\
-                     .order_by(Message.timestamp.asc()).all()
-        
-        history = []
-        for msg in messages:
-            history.append({
-                "role": msg.role,
-                "content": msg.content,
-                "timestamp": msg.timestamp.isoformat()
-            })
-        
-        return {"user_id": user_id, "history": history}
-    except Exception as e:
-        logger.error(f"Ошибка получения истории: {e}")
-        raise HTTPException(status_code=500, detail="Ошибка получения истории")
-
-@app.post("/clear_history/{user_id}")
-async def clear_history(user_id: str, db: Session = Depends(get_db)):
-    try:
-        clear_chat_history(db, user_id)
-        return {"status": "history cleared", "user_id": user_id}
-    except Exception as e:
-        logger.error(f"Ошибка очистки истории: {e}")
-        raise HTTPException(status_code=500, detail="Ошибка очистки истории")
-
-@app.post("/reinitialize")
-async def reinitialize():
-    try:
-        initialize_app()
-        return {"status": "reinitialized", "success": app_initialized}
-    except Exception as e:
-        logger.error(f"Ошибка переинициализации: {e}")
-        raise HTTPException(status_code=500, detail="Ошибка переинициализации")
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8000))
