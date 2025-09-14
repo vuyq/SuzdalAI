@@ -91,7 +91,7 @@ class Config:
     MEMORY_CONTEXT_SIZE = 10
     PREFERENCES_UPDATE_INTERVAL = 5
     SEMANTIC_SEARCH_K = 3
-    MAX_EMBEDDING_TOKENS = 500  # Добавляем лимит токенов для эмбеддингов
+    MAX_EMBEDDING_TOKENS = 500
 
 # Глобальные переменные
 embedding_model = None
@@ -258,7 +258,7 @@ def perform_web_search(query: str) -> str:
         return "\n\n".join(results) if results else "Не найдено результатов"
     except Exception as e:
         logger.error(f"Ошибка веб-поиска: {e}")
-        return "Ошибка при выполнении поиска"
+        return f"Ошибка при выполнении поиска. Попробуйте поискать информацию о '{query} Суздаль' в поисковых системах."
 
 def search_in_vector_store(query: str, k: int = None) -> List[Document]:
     if not vector_store or not document_retriever:
@@ -290,7 +290,6 @@ def fuzzy_retrieval(question: str, docs: List[Document], limit: int = 5) -> List
     return results
 
 def cosine_similarity(vec1, vec2):
-    """Вычисляет косинусную схожесть между двумя векторами"""
     if not vec1 or not vec2:
         return 0.0
     dot_product = sum(a * b for a, b in zip(vec1, vec2))
@@ -299,16 +298,11 @@ def cosine_similarity(vec1, vec2):
     return dot_product / (norm1 * norm2) if norm1 and norm2 else 0.0
 
 def truncate_text_for_embedding(text: str, max_tokens: int = None) -> str:
-    """
-    Обрезает текст до максимального количества токенов для эмбеддинга.
-    Использует простую эвристику: примерно 4 символа = 1 токен.
-    """
     max_tokens = max_tokens or Config.MAX_EMBEDDING_TOKENS
-    max_chars = max_tokens * 4  # Консервативная оценка
+    max_chars = max_tokens * 4
     if len(text) <= max_chars:
         return text
     
-    # Обрезаем до последнего полного предложения в пределах лимита
     truncated = text[:max_chars]
     last_period = truncated.rfind('.')
     last_question = truncated.rfind('?')
@@ -316,10 +310,9 @@ def truncate_text_for_embedding(text: str, max_tokens: int = None) -> str:
     
     end_pos = max(last_period, last_question, last_exclamation)
     
-    if end_pos > 0 and end_pos > max_chars * 0.7:  # Если нашли разумную точку обрезки
+    if end_pos > 0 and end_pos > max_chars * 0.7:
         return truncated[:end_pos + 1]
     else:
-        # Если не нашли хорошую точку обрезки, обрезаем по границе слова
         last_space = truncated.rfind(' ')
         if last_space > max_chars * 0.7:
             return truncated[:last_space]
@@ -327,12 +320,10 @@ def truncate_text_for_embedding(text: str, max_tokens: int = None) -> str:
             return truncated
 
 def semantic_search_messages(query: str, messages: List[Message], k: int = 3) -> List[Message]:
-    """Семантический поиск по истории сообщений"""
     if not messages or not embedding_model:
         return messages[-k:] if k < len(messages) else messages
     
     try:
-        # Обрезаем запрос если он слишком длинный
         truncated_query = truncate_text_for_embedding(query)
         query_embedding = embedding_model.embed_query(truncated_query)
         
@@ -352,7 +343,6 @@ def semantic_search_messages(query: str, messages: List[Message], k: int = 3) ->
         return messages[-k:] if k < len(messages) else messages
 
 def extract_user_preferences(messages: List[Message]) -> Dict[str, Any]:
-    """Извлекает предпочтения пользователя из истории диалога"""
     preferences = {
         "communication_style": "standard",
         "topics_of_interest": [],
@@ -401,7 +391,6 @@ def extract_user_preferences(messages: List[Message]) -> Dict[str, Any]:
     return preferences
 
 def generate_conversation_summary(messages: List[Message]) -> str:
-    """Генерирует семантическое резюме диалога"""
     if not messages:
         return "Нет истории диалога"
     
@@ -415,7 +404,6 @@ def generate_conversation_summary(messages: List[Message]) -> str:
     return "\n".join(summary_parts)
 
 def apply_preferences_to_prompt(response: str, preferences: Dict[str, Any]) -> str:
-    """Применяет предпочтения пользователя к стилю ответа"""
     if preferences["communication_style"] == "formal":
         response = re.sub(r"[😀-🙏️⚡️❤️🔥]", "", response)
         response = re.sub(r"\!+", ".", response)
@@ -487,14 +475,12 @@ def update_dialog_context(db: Session, user_id: str, role: str, message: str):
         message_embedding = None
         if embedding_model and len(message) > 10:
             try:
-                # Обрезаем сообщение если оно слишком длинное
                 truncated_message = truncate_text_for_embedding(message)
                 message_embedding = embedding_model.embed_query(truncated_message)
             except Exception as e:
                 logger.error(f"Ошибка создания эмбеддинга: {e}")
-                # Пробуем еще более короткую версию
                 try:
-                    very_short_message = message[:500]  # Сильное обрезание
+                    very_short_message = message[:500]
                     message_embedding = embedding_model.embed_query(very_short_message)
                 except Exception as e2:
                     logger.error(f"Ошибка создания эмбеддинга даже после обрезки: {e2}")
@@ -520,7 +506,6 @@ def update_dialog_context(db: Session, user_id: str, role: str, message: str):
         raise
 
 def get_relevant_memory(db: Session, user_id: str, current_question: str) -> str:
-    """Получает релевантные сообщения из истории с помощью семантического поиска"""
     try:
         messages = db.query(Message).filter(Message.session_id == user_id).all()
         if not messages:
@@ -600,7 +585,6 @@ def is_message_unclear(message: str) -> bool:
 def needs_clarification(question: str) -> Tuple[bool, str, Optional[Dict]]:
     q = question.lower()
     
-    # Пропускаем запросы на поиск в интернете
     search_keywords = ["поиск в интернете", "найди в интернете", "поищи в интернете", "веб поиск"]
     if any(keyword in q for keyword in search_keywords):
         return False, "", None
@@ -689,7 +673,7 @@ def handle_clarification_response(db: Session, user_id: str, response: str, cont
             response_text += "Хотите, чтобы я сделал расширенный рассказ об этих местах? Напишите 'да' или 'расскажи подробнее'."
         else:
             web_results = perform_web_search(search_query)
-            response_text = f"🌐 Вот что удалось найти в интернете:\n\n{web_results}"
+            response_text = f"📚 В базе ничего не найдено.\n\n🌐 Вот что удалось найти в интернете:\n\n{web_results}"
         
         return response_text
         
@@ -707,14 +691,11 @@ def handle_question(db: Session, question: str, user_id: str) -> str:
 
     session = db.query(ChatSession).filter(ChatSession.id == user_id).first()
     
-    # Обработка ответов на запрос о поиске в интернете
     if session and session.clarification_context and session.clarification_context.get("type") == "web_search":
         if question.lower() in ["да", "yes", "конечно", "ага", "ок", "хочу"]:
-            # Выполняем поиск в интернете
             original_question = session.clarification_context.get("original_question", "")
             web_results = perform_web_search(original_question)
             
-            # Очищаем контекст уточнения
             session.clarification_context = None
             db.commit()
             
@@ -722,19 +703,16 @@ def handle_question(db: Session, question: str, user_id: str) -> str:
             update_dialog_context(db, user_id, "assistant", response)
             return response
         elif question.lower() in ["нет", "no", "не надо", "не нужно"]:
-            # Отменяем поиск
             session.clarification_context = None
             db.commit()
             response = "Хорошо, поиск в интернете отменен. Чем еще могу помочь?"
             update_dialog_context(db, user_id, "assistant", response)
             return response
         else:
-            # Непонятный ответ на запрос о поиске
             response = "Пожалуйста, ответьте 'да' или 'нет' на вопрос о поиске в интернете."
             update_dialog_context(db, user_id, "assistant", response)
             return response
 
-    # Обработка обычных уточнений (рестораны, музеи и т.д.)
     if session and session.clarification_context:
         return handle_clarification_response(db, user_id, question, session.clarification_context)
 
@@ -750,18 +728,10 @@ def handle_question(db: Session, question: str, user_id: str) -> str:
     relevant_memory = get_relevant_memory(db, user_id, question)
     full_context = f"{conversation_summary}\n{relevant_memory}" if conversation_summary else relevant_memory
 
-    # Проверяем, не запрашивает ли пользователь поиск в интернете
     search_keywords = ["поиск в интернете", "найди в интернете", "поищи в интернете", "веб поиск", "google", "яндекс"]
     if any(keyword in question.lower() for keyword in search_keywords):
-        # Сохраняем контекст для подтверждения поиска
-        if session:
-            session.clarification_context = {
-                "type": "web_search",
-                "original_question": question
-            }
-            db.commit()
-        
-        response = "Хотите, чтобы я выполнил поиск этой информации в интернете? Ответьте 'да' или 'нет'."
+        web_results = perform_web_search(question)
+        response = f"🌐 Вот что удалось найти в интернете:\n\n{web_results}"
         update_dialog_context(db, user_id, "assistant", response)
         return response
 
@@ -775,7 +745,8 @@ def handle_question(db: Session, question: str, user_id: str) -> str:
                 ai_answer = generate_ai_response(last_q, context_docs, "", full_context, user_preferences)
                 response = f"🤖 Расширенный рассказ:\n\n{ai_answer}"
             else:
-                response = "К сожалению, не могу найти информацию для подробного рассказа."
+                web_results = perform_web_search(last_q)
+                response = f"📚 В базе ничего не найдено.\n\n🌐 Вот что удалось найти в интернете:\n\n{web_results}"
         else:
             response = "Не могу найти предыдущий запрос для подробного рассказа."
         update_dialog_context(db, user_id, "assistant", response)
@@ -804,15 +775,8 @@ def handle_question(db: Session, question: str, user_id: str) -> str:
             "Хотите более подробную информацию или поиск в интернете?"
         )
     else:
-        # Если ничего не найдено в базе, предлагаем поиск в интернете
-        if session:
-            session.clarification_context = {
-                "type": "web_search",
-                "original_question": question
-            }
-            db.commit()
-        
-        response = "В базе ничего не найдено. Хотите, чтобы я поискал эту информацию в интернете? Ответьте 'да' или 'нет'."
+        web_results = perform_web_search(question)
+        response = f"📚 В базе ничего не найдено.\n\n🌐 Вот что удалось найти в интернете:\n\n{web_results}"
 
     update_dialog_context(db, user_id, "assistant", response)
     return response
