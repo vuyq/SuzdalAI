@@ -54,62 +54,6 @@ class Message(Base):
     role = Column(String(10), nullable=False)
     content = Column(Text, nullable=False)
     timestamp = Column(DateTime, default=datetime.utcnow)
-    message_metadata = Column(JSON, nullable=True)import os
-import requests
-import pandas as pd
-from pathlib import Path
-from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Depends
-from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import create_engine, Column, String, Text, DateTime, Integer
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session
-from sqlalchemy.dialects.postgresql import JSON
-from datetime import datetime
-from pydantic import BaseModel
-from langchain_core.documents import Document
-from langchain_gigachat import GigaChat, GigaChatEmbeddings
-from langchain_community.vectorstores import FAISS
-from langchain_core.prompts import PromptTemplate
-from tenacity import retry, stop_after_attempt, wait_exponential
-from ddgs import DDGS
-import logging
-from typing import Dict, List, Optional, Tuple
-import uuid
-import re
-
-# Настройка логирования
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# Загрузка переменных окружения
-load_dotenv()
-
-# Настройки базы данных
-DATABASE_URL = os.getenv("DATABASE_URL")
-if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-
-engine = create_engine(DATABASE_URL)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
-
-# Модели базы данных
-class ChatSession(Base):
-    __tablename__ = "chat_sessions"
-    
-    id = Column(String(100), primary_key=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
-class Message(Base):
-    __tablename__ = "messages"
-    
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    session_id = Column(String(100), nullable=False)
-    role = Column(String(10), nullable=False)
-    content = Column(Text, nullable=False)
-    timestamp = Column(DateTime, default=datetime.utcnow)
     message_metadata = Column(JSON, nullable=True)
 
 # Создание таблиц
