@@ -5,10 +5,9 @@ from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import create_engine, Column, String, Text, DateTime, Integer, ForeignKey, JSON, text
+from sqlalchemy import create_engine, Column, String, Text, DateTime, Integer, ForeignKey, JSON
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship
-from sqlalchemy import inspect
 from datetime import datetime, timedelta
 from pydantic import BaseModel
 from langchain_core.documents import Document
@@ -27,10 +26,9 @@ from functools import lru_cache
 import time
 import re
 import numpy as np
-import traceback
 
 # Логирование
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Переменные окружения
@@ -140,10 +138,8 @@ def download_certificate():
                 f.write(response.content)
             logger.info("Сертификат успешно загружен")
         except Exception as e:
-            logger.warning(f"Ошибка загрузки сертификата: {e}")
-            # Создаем пустой файл для продолжения работы
-            Path(Config.CERT_PATH).touch()
-            logger.info("Создан пустой файл сертификата для продолжения работы")
+            logger.error(f"Ошибка загрузки сертификата: {e}")
+            raise
 
 @retry(stop=stop_after_attempt(Config.MAX_RETRIES), wait=wait_exponential(multiplier=1, min=2, max=10))
 def get_gigachat_token() -> str:
@@ -155,12 +151,9 @@ def get_gigachat_token() -> str:
         'Authorization': f'Basic {Config.GIGACHAT_AUTH}'
     }
     payload = {'scope': 'GIGACHAT_API_PERS'}
-    
-    verify_ssl = Path(Config.CERT_PATH).exists() and os.path.getsize(Config.CERT_PATH) > 0
-    
     response = requests.post(
         url, headers=headers, data=payload,
-        verify=verify_ssl, timeout=Config.REQUEST_TIMEOUT
+        verify=Config.CERT_PATH, timeout=Config.REQUEST_TIMEOUT
     )
     response.raise_for_status()
     return response.json().get("access_token")
@@ -168,31 +161,19 @@ def get_gigachat_token() -> str:
 def initialize_models() -> Tuple[GigaChatEmbeddings, GigaChat]:
     try:
         access_token = token_manager.get_valid_token()
-        
-        verify_ssl = Path(Config.CERT_PATH).exists() and os.path.getsize(Config.CERT_PATH) > 0
-        ca_bundle = Config.CERT_PATH if verify_ssl else None
-        
         embedding_model = GigaChatEmbeddings(
-            access_token=access_token, 
-            model="Embeddings", 
-            scope="GIGACHAT_API_PERS",
-            verify_ssl_certs=verify_ssl,
-            ca_bundle_file=ca_bundle,
+            access_token=access_token, model="Embeddings", scope="GIGACHAT_API_PERS",
+            verify_ssl_certs=bool(Config.CERT_PATH),
+            ca_bundle_file=Config.CERT_PATH if Path(Config.CERT_PATH).exists() else None,
             timeout=Config.REQUEST_TIMEOUT
         )
-        
         ai_assistant = GigaChat(
-            access_token=access_token, 
-            model="GigaChat", 
-            temperature=0.2,
-            verify_ssl_certs=verify_ssl,
-            ca_bundle_file=ca_bundle,
-            timeout=Config.REQUEST_TIMEOUT, 
-            verbose=False
+            access_token=access_token, model="GigaChat", temperature=0.2,
+            verify_ssl_certs=bool(Config.CERT_PATH),
+            ca_bundle_file=Config.CERT_PATH if Path(Config.CERT_PATH).exists() else None,
+            timeout=Config.REQUEST_TIMEOUT, verbose=True
         )
-        
         return embedding_model, ai_assistant
-        
     except Exception as e:
         logger.error(f"Ошибка инициализации моделей: {e}")
         raise
@@ -202,9 +183,6 @@ def refresh_models():
     try:
         access_token = token_manager.get_valid_token()
         
-        verify_ssl = Path(Config.CERT_PATH).exists() and os.path.getsize(Config.CERT_PATH) > 0
-        ca_bundle = Config.CERT_PATH if verify_ssl else None
-        
         if embedding_model:
             embedding_model.access_token = access_token
         
@@ -212,102 +190,55 @@ def refresh_models():
             ai_assistant.access_token = access_token
         else:
             ai_assistant = GigaChat(
-                access_token=access_token, 
-                model="GigaChat", 
-                temperature=0.2,
-                verify_ssl_certs=verify_ssl,
-                ca_bundle_file=ca_bundle,
-                timeout=Config.REQUEST_TIMEOUT, 
-                verbose=False
+                access_token=access_token, model="GigaChat", temperature=0.2,
+                verify_ssl_certs=bool(Config.CERT_PATH),
+                ca_bundle_file=Config.CERT_PATH if Path(Config.CERT_PATH).exists() else None,
+                timeout=Config.REQUEST_TIMEOUT, verbose=True
             )
             
         logger.info("Модели успешно обновлены с новым токеном")
     except Exception as e:
         logger.error(f"Ошибка обновления моделей: {e}")
-        # Не падаем, продолжаем работу в degraded mode
+        raise
 
 def load_data() -> List[Document]:
     try:
+        df = pd.read_csv(Config.CSV_DATA_URL, sep=';', on_bad_lines='skip')
+    except Exception:
         try:
-            df = pd.read_csv(Config.CSV_DATA_URL, sep=';', on_bad_lines='skip')
-        except Exception:
-            try:
-                df = pd.read_csv(Config.CSV_DATA_URL, on_bad_lines='skip')
-            except Exception as e:
-                logger.error(f"Ошибка загрузки CSV: {e}")
-                # Пробуем создать минимальный набор данных
-                return create_fallback_data()
+            df = pd.read_csv(Config.CSV_DATA_URL, on_bad_lines='skip')
+        except Exception as e:
+            logger.error(f"Ошибка загрузки CSV: {e}")
+            return []
 
-        documents = []
-        for _, row in df.iterrows():
-            metadata, content = {}, []
-            for col, val in row.items():
-                if pd.isna(val) or str(val).strip() == '':
-                    continue
-                col_lower = col.lower()
-                if col_lower in ['name', 'title', 'название']:
-                    metadata['name'] = str(val)
-                elif col_lower in ['type', 'тип', 'category', 'категория']:
-                    metadata['type'] = str(val)
-                elif col_lower in ['address', 'адрес']:
-                    metadata['address'] = str(val)
-                elif col_lower in ['price', 'цена']:
-                    metadata['price'] = str(val)
-                elif col_lower in ['hours', 'часы']:
-                    metadata['hours'] = str(val)
-                elif col_lower in ['description', 'описание']:
-                    metadata['description'] = str(val)
-                else:
-                    content.append(f"{col}: {val}")
-            
-            if not metadata.get('name'):
-                continue
-                
-            doc = Document(
-                page_content="\n".join(content) if content else metadata.get('description', ''),
-                metadata=metadata
-            )
-            documents.append(doc)
-            
-        logger.info(f"Загружено {len(documents)} документов из CSV")
-        return documents
-        
-    except Exception as e:
-        logger.error(f"Критическая ошибка загрузки данных: {e}")
-        return create_fallback_data()
-
-def create_fallback_data() -> List[Document]:
-    """Создает fallback данные о Суздале"""
-    fallback_data = [
-        {
-            'name': 'Суздальский кремль',
-            'type': 'достопримечательность',
-            'address': 'ул. Кремлевская, д. 1',
-            'description': 'Исторический центр Суздаля, древнейшее сооружение города'
-        },
-        {
-            'name': 'Ресторан Русская изба',
-            'type': 'ресторан',
-            'address': 'ул. Ленина, д. 15',
-            'description': 'Традиционная русская кухня в аутентичной обстановке'
-        },
-        {
-            'name': 'Гостиница Горячие ключи',
-            'type': 'отель',
-            'address': 'ул. Коровники, д. 45',
-            'description': 'Комфортабельный отель с бассейном и спа'
-        }
-    ]
-    
     documents = []
-    for data in fallback_data:
+    for _, row in df.iterrows():
+        metadata, content = {}, []
+        for col, val in row.items():
+            if pd.isna(val) or str(val).strip() == '':
+                continue
+            col_lower = col.lower()
+            if col_lower in ['name', 'title', 'название']:
+                metadata['name'] = str(val)
+            elif col_lower in ['type', 'тип', 'category', 'категория']:
+                metadata['type'] = str(val)
+            elif col_lower in ['address', 'адрес']:
+                metadata['address'] = str(val)
+            elif col_lower in ['price', 'цена']:
+                metadata['price'] = str(val)
+            elif col_lower in ['hours', 'часы']:
+                metadata['hours'] = str(val)
+            elif col_lower in ['description', 'описание']:
+                metadata['description'] = str(val)
+            else:
+                content.append(f"{col}: {val}")
+        if 'name' not in metadata:
+            continue
         doc = Document(
-            page_content=data['description'],
-            metadata=data
+            page_content="\n".join(content) if content else metadata.get('description', ''),
+            metadata=metadata
         )
         documents.append(doc)
-    
-    logger.info(f"Создано {len(documents)} fallback документов")
     return documents
 
 @lru_cache(maxsize=100)
@@ -323,7 +254,7 @@ def perform_web_search(query: str) -> str:
         return "Ошибка при выполнении поиска"
 
 def search_in_vector_store(query: str, k: int = None) -> List[Document]:
-    if not vector_store:
+    if not vector_store or not document_retriever:
         return []
     
     try:
@@ -351,16 +282,49 @@ def fuzzy_retrieval(question: str, docs: List[Document], limit: int = 5) -> List
             results.append(docs[idx])
     return results
 
-TOURISM_PROMPT_TEMPLATE = """
-Ты виртуальный гид по Суздалю. Отвечай на русском языке кратко и информативно.
+def cosine_similarity(vec1, vec2):
+    if not vec1 or not vec2:
+        return 0.0
+    dot_product = sum(a * b for a, b in zip(vec1, vec2))
+    norm1 = sum(a * a for a in vec1) ** 0.5
+    norm2 = sum(b * b for b in vec2) ** 0.5
+    return dot_product / (norm1 * norm2) if norm1 and norm2 else 0.0
 
-Информация о достопримечательностях:
+def build_gigachat_messages(db: Session, user_id: str, current_question: str) -> List[Dict[str, str]]:
+    """Формируем массив сообщений для GigaChat API"""
+    messages = db.query(Message).filter(Message.session_id == user_id).order_by(Message.timestamp.asc()).all()
+    
+    chat_history = []
+    for msg in messages:
+        chat_history.append({
+            "role": msg.role,
+            "content": msg.content
+        })
+    
+    # Добавляем текущий вопрос
+    chat_history.append({"role": "user", "content": current_question})
+    
+    return chat_history
+
+TOURISM_PROMPT_TEMPLATE = """
+Ты виртуальный гид по Суздалю. Учитывай контекст предыдущего диалога и предпочтения пользователя.
+
+[Семантическая память диалога]:
+{conversation_summary}
+
+[Предпочтения пользователя]:
+{user_preferences}
+
+[Данные из базы о достопримечательностях]:
 {context}
 
-Вопрос пользователя: {question}
+[Веб-результаты]:
+{web_search}
 
-Ответь максимально полезно и точно на основе предоставленной информации.
-Если информации недостаточно, вежливо сообщи об этом.
+[Текущий вопрос]:
+{question}
+
+Отвечай на русском языке.
 """
 tourism_prompt = PromptTemplate.from_template(TOURISM_PROMPT_TEMPLATE)
 
@@ -368,94 +332,29 @@ def generate_ai_response(db: Session, user_id: str, question: str,
                          context_docs: List[Document], web_results: str,
                          conversation_summary: str, user_preferences: Dict) -> str:
     try:
-        # Проверяем доступность GigaChat
-        if not ai_assistant or not token_manager or not token_manager.is_token_valid():
+        if not token_manager.is_token_valid():
             refresh_models()
-            if not ai_assistant:
-                return generate_fallback_response(question, context_docs)
 
-        # Формируем контекст из найденных документов
-        context_text = ""
-        if context_docs:
-            for i, doc in enumerate(context_docs[:3], 1):
-                context_text += f"\n{i}. {doc.metadata.get('name', 'Объект')}: "
-                if doc.metadata.get('description'):
-                    context_text += f"{doc.metadata['description'][:200]}... "
-                if doc.metadata.get('address'):
-                    context_text += f"Адрес: {doc.metadata['address']} "
-                if doc.metadata.get('hours'):
-                    context_text += f"Часы: {doc.metadata['hours']}"
-        else:
-            context_text = "Информация не найдена в базе данных"
+        messages = build_gigachat_messages(db, user_id, question)
 
-        # Формируем системный промпт
+        # Системный промпт
         system_prompt = tourism_prompt.format(
             question=question,
-            context=context_text or "Нет данных в базе",
+            context="\n\n".join(d.page_content for d in context_docs) if context_docs else "Нет данных в базе",
+            web_search=web_results or "Нет результатов",
+            conversation_summary=conversation_summary or "Нет истории",
+            user_preferences=json.dumps(user_preferences, ensure_ascii=False, indent=2)
         )
 
-        # Создаем сообщения для API
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": question}
-        ]
+        messages.insert(0, {"role": "system", "content": system_prompt})
 
-        # Вызываем модель
-        response = ai_assistant.invoke({
-            "model": "GigaChat", 
-            "messages": messages,
-            "temperature": 0.2,
-            "max_tokens": 500
-        })
-        
+        response = ai_assistant.invoke({"model": "GigaChat", "messages": messages})
         response_text = response.content if hasattr(response, "content") else str(response)
         return response_text
 
     except Exception as e:
         logger.error(f"Ошибка генерации ответа: {e}")
-        logger.error(traceback.format_exc())
-        return generate_fallback_response(question, context_docs)
-
-def generate_fallback_response(question: str, context_docs: List[Document]) -> str:
-    """Fallback ответ когда GigaChat недоступен"""
-    question_lower = question.lower()
-    
-    # Ответы про еду
-    if any(keyword in question_lower for keyword in ['где поесть', 'еда', 'ресторан', 'кафе', 'столовая', 'питание']):
-        restaurants = [doc for doc in context_docs if doc.metadata.get('type', '').lower() in 
-                      ['ресторан', 'кафе', 'столовая', 'еда', 'питание', 'food']]
-        
-        if restaurants:
-            response = "В Суздале есть несколько мест где можно поесть:\n\n"
-            for i, rest in enumerate(restaurants[:5], 1):
-                response += f"{i}. {rest.metadata.get('name', 'Заведение')}\n"
-                if 'address' in rest.metadata:
-                    response += f"   Адрес: {rest.metadata['address']}\n"
-                if 'hours' in rest.metadata:
-                    response += f"   Часы работы: {rest.metadata['hours']}\n"
-                response += "\n"
-            return response + "\nРекомендую уточнить у местных жителей о текущем режиме работы."
-        else:
-            return "В Суздале есть множество кафе и ресторанов с традиционной русской кухней. Рекомендую посетить рестораны в центре города или спросить у местных жителей о лучших местах."
-
-    # Ответы про достопримечательности
-    elif any(keyword in question_lower for keyword in ['достопримечательность', 'что посмотреть', 'куда сходить', 'музей', 'кремль']):
-        attractions = [doc for doc in context_docs if doc.metadata.get('type', '').lower() in 
-                      ['достопримечательность', 'музей', 'памятник', 'attraction']]
-        
-        if attractions:
-            response = "Основные достопримечательности Суздаля:\n\n"
-            for i, attr in enumerate(attractions[:5], 1):
-                response += f"{i}. {attr.metadata.get('name', 'Достопримечательность')}\n"
-                if 'description' in attr.metadata:
-                    response += f"   {attr.metadata['description'][:100]}...\n"
-                response += "\n"
-            return response
-        else:
-            return "Суздаль богат достопримечательностями: Суздальский кремль, Музей деревянного зодчества, многочисленные церкви и монастыри. Обязательно посетите исторический центр города."
-
-    # Общий ответ
-    return "Извините, в данный момент я не могу обработать ваш запрос. Суздаль - прекрасный город с богатой историей, множеством достопримечательностей и уютных мест. Рекомендую обратиться в местный туристический центр за подробной информацией."
+        return "Извините, произошла ошибка при генерации ответа."
 
 def handle_question(db: Session, question: str, user_id: str) -> str:
     if not app_initialized:
@@ -465,40 +364,36 @@ def handle_question(db: Session, question: str, user_id: str) -> str:
     if not question:
         return "Пожалуйста, задайте ваш вопрос о Суздале."
 
-    # Получаем или создаем сессию
     session = db.query(ChatSession).filter(ChatSession.id == user_id).first()
-    if not session:
-        session = ChatSession(id=user_id)
-        db.add(session)
-        db.commit()
 
-    # Сохраняем вопрос пользователя
+    # сохраняем вопрос пользователя
     db.add(Message(session_id=user_id, role="user", content=question, timestamp=datetime.utcnow()))
     db.commit()
 
     user_preferences = session.user_preferences if session and session.user_preferences else {}
     conversation_summary = session.conversation_summary if session else ""
 
-    # Ищем релевантную информацию
-    context_docs = []
-    if vector_store:
-        context_docs = search_in_vector_store(question)
+    context_docs = search_in_vector_store(question)
     if not context_docs and documents:
         context_docs = fuzzy_retrieval(question, documents, limit=Config.RETRIEVER_K)
 
-    # Генерируем ответ
     ai_answer = generate_ai_response(db, user_id, question, context_docs, "", conversation_summary, user_preferences)
 
-    # Сохраняем ответ ассистента
-    db.add(Message(session_id=user_id, role="assistant", content=ai_answer, timestamp=datetime.utcnow()))
+    response = ai_answer
+
+    db.add(Message(session_id=user_id, role="assistant", content=response, timestamp=datetime.utcnow()))
     db.commit()
 
-    return ai_answer
+    return response
 
 def safe_init_db():
     """Безопасная инициализация базы данных без удаления таблиц"""
+    from sqlalchemy import inspect, text
+    
     try:
         inspector = inspect(engine)
+        
+        # Проверяем существование таблиц
         existing_tables = inspector.get_table_names()
         
         # Создаем chat_sessions если не существует
@@ -534,25 +429,29 @@ def safe_init_db():
                 conn.commit()
                 logger.info("Таблица messages создана")
         
-        # Безопасно добавляем недостающие колонки
+        # БЕЗОПАСНО добавляем недостающие колонки
         try:
             if 'chat_sessions' in existing_tables:
                 chat_columns = [col['name'] for col in inspector.get_columns('chat_sessions')]
                 
+                # Добавляем только отсутствующие колонки
                 if 'user_preferences' not in chat_columns:
                     with engine.connect() as conn:
                         conn.execute(text("ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS user_preferences JSONB"))
                         conn.commit()
+                        logger.info("Добавлена колонка user_preferences")
                         
                 if 'conversation_summary' not in chat_columns:
                     with engine.connect() as conn:
                         conn.execute(text("ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS conversation_summary TEXT"))
                         conn.commit()
+                        logger.info("Добавлена колонка conversation_summary")
                         
                 if 'clarification_context' not in chat_columns:
                     with engine.connect() as conn:
                         conn.execute(text("ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS clarification_context JSONB"))
                         conn.commit()
+                        logger.info("Добавлена колонка clarification_context")
             
             if 'messages' in existing_tables:
                 messages_columns = [col['name'] for col in inspector.get_columns('messages')]
@@ -560,12 +459,15 @@ def safe_init_db():
                     with engine.connect() as conn:
                         conn.execute(text("ALTER TABLE messages ADD COLUMN IF NOT EXISTS embeddings JSONB"))
                         conn.commit()
+                        logger.info("Добавлена колонка embeddings")
                         
         except Exception as e:
             logger.warning(f"Ошибка при добавлении колонок: {e}")
+            # Продолжаем работу даже если есть ошибки
             
     except Exception as e:
         logger.error(f"Ошибка инициализации базы: {e}")
+        # Не падаем, пытаемся работать дальше
 
 # Инициализация базы данных
 safe_init_db()
@@ -574,45 +476,25 @@ def initialize_app():
     global embedding_model, ai_assistant, documents, vector_store, document_retriever, app_initialized, token_manager
     
     try:
-        # Загружаем сертификат
         download_certificate()
-        
-        # Инициализируем токен менеджер
         token_manager = GigaChatTokenManager()
-        
-        # Пытаемся инициализировать модели
-        try:
-            embedding_model, ai_assistant = initialize_models()
-            logger.info("Модели GigaChat успешно инициализированы")
-        except Exception as model_error:
-            logger.error(f"Ошибка инициализации моделей GigaChat: {model_error}")
-            ai_assistant = None
-            embedding_model = None
-        
-        # Загружаем данные
+        embedding_model, ai_assistant = initialize_models()
         documents = load_data()
         
-        # Создаем векторное хранилище если есть модели и данные
-        if documents and embedding_model:
-            try:
-                vector_store = FAISS.from_documents(documents, embedding_model)
-                document_retriever = vector_store.as_retriever(search_kwargs={"k": Config.RETRIEVER_K})
-                logger.info(f"Векторное хранилище создано, {len(documents)} документов")
-            except Exception as vector_error:
-                logger.error(f"Ошибка создания векторного хранилища: {vector_error}")
-                vector_store = None
-                document_retriever = None
+        if documents:
+            vector_store = FAISS.from_documents(documents, embedding_model)
+            document_retriever = vector_store.as_retriever(search_kwargs={"k": Config.RETRIEVER_K})
+            logger.info(f"Приложение успешно инициализировано, загружено {len(documents)} документов")
         else:
-            logger.warning("Векторное хранилище не создано (нет данных или моделей)")
+            logger.warning("Документы не загружены, RAG будет работать в ограниченном режиме")
         
         app_initialized = True
-        logger.info("Приложение инициализировано")
         
     except Exception as e:
-        logger.critical(f"Критическая ошибка инициализации: {e}")
-        logger.error(traceback.format_exc())
-        documents = create_fallback_data()
-        app_initialized = True  # Все равно запускаем в fallback режиме
+        logger.critical(f"Ошибка инициализации: {e}")
+        documents = []
+        app_initialized = False
+        raise
 
 initialize_app()
 
@@ -640,19 +522,17 @@ async def ask(item: Question, db: Session = Depends(get_db)):
         return {"answer": response}
     except Exception as e:
         logger.error(f"Ошибка обработки вопроса: {e}")
-        logger.error(traceback.format_exc())
-        return {"answer": "Извините, произошла ошибка при обработке вашего запроса. Попробуйте еще раз."}
+        raise HTTPException(status_code=500, detail="Ошибка обработки вопроса")
 
 @app.get("/health")
 async def health_check():
-    status = "healthy" if app_initialized else "degraded"
+    status = "healthy" if app_initialized and documents else "degraded"
     return {
         "status": status, 
         "initialized": app_initialized,
         "timestamp": datetime.utcnow(),
         "documents_loaded": len(documents),
-        "gigachat_available": ai_assistant is not None,
-        "vector_store_available": vector_store is not None
+        "token_valid": token_manager.is_token_valid() if token_manager else False
     }
 
 if __name__ == "__main__":
