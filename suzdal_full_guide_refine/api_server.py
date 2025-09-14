@@ -117,7 +117,7 @@ def download_certificate():
 @retry(stop=stop_after_attempt(Config.MAX_RETRIES), 
       wait=wait_exponential(multiplier=1, min=2, max=10))
 def get_gigachat_token() -> str:
-    """Получение токена доступа GigaChat"""
+    """Получение токена доaccess GigaChat"""
     url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
     headers = {
         'Content-Type': 'application/x-www-form-urlencoded',
@@ -322,10 +322,10 @@ def needs_clarification(question: str) -> Tuple[bool, Optional[str]]:
         not any(word in question_lower for word in ['бюджет', 'цена', 'стоимость', 'центр', 'район'])):
         
         return True, (
-            "🍝 Отлично! Теперь, пожалуйста, уточните:\n\n"
-            "• **Бюджет**: какой диапазон цен предпочитаете?\n"
-            "• **Расположение**: в центре города или не важно?\n"
-            "• **Атмосфера**: уютное кафе или ресторан для ужина?\n\n"
+            "Отлично! Теперь, пожалуйста, уточните:\n\n"
+            "• Бюджет: какой диапазон цен предпочитаете?\n"
+            "• Расположение: в центре города или не важно?\n"
+            "• Атмосфера: уютное кафе или ресторан для ужина?\n\n"
             "Что для вас важнее?"
         )
     
@@ -334,10 +334,10 @@ def needs_clarification(question: str) -> Tuple[bool, Optional[str]]:
         not specified_params['cuisine'] and not specified_params['budget']):
         
         return True, (
-            "🍽️ Хорошо! Теперь уточните:\n\n"
-            "• **Кухня**: какую кухню предпочитаете?\n"
-            "• **Бюджет**: примерный диапазон цен?\n"
-            "• **Местоположение**: где бы хотели?\n\n"
+            "Хорошо! Теперь уточните:\n\n"
+            "• Кухня: какую кухню предпочитаете?\n"
+            "• Бюджет: примерный диапазон цен?\n"
+            "• Местоположение: где бы хотели?\n\n"
             "Что для вас в приоритете?"
         )
     
@@ -366,13 +366,13 @@ def needs_clarification(question: str) -> Tuple[bool, Optional[str]]:
                 missing_params.append("тип заведения")
             
             if missing_params:
-                clarification = f"🍽️ Отлично! Уточните {', '.join(missing_params)}:\n\n"
+                clarification = f"Отлично! Уточните {', '.join(missing_params)}:\n\n"
                 if 'бюджет' in missing_params:
-                    clarification += "• **Бюджет**: экономный, средний, премиум?\n"
+                    clarification += "• Бюджет: экономный, средний, премиум?\n"
                 if 'расположение' in missing_params:
-                    clarification += "• **Расположение**: центр, рядом с достопримечательностями?\n"
+                    clarification += "• Расположение: центр, рядом с достопримечательностями?\n"
                 if 'тип заведения' in missing_params:
-                    clarification += "• **Тип**: кафе, ресторан, паб?\n"
+                    clarification += "• Тип: кафе, ресторан, паб?\n"
                 clarification += "\nЧто для вас важнее?"
                 return True, clarification
             
@@ -390,57 +390,58 @@ def needs_clarification(question: str) -> Tuple[bool, Optional[str]]:
 def get_food_clarification() -> str:
     """Уточняющий вопрос для еды"""
     return (
-        "🍽️ Чтобы порекомендовать подходящие места, уточните:\n\n"
-        "• **Тип кухни**: русская, итальянская, европейская, азиатская?\n"
-        "• **Бюджет**: экономный, средний, премиум?\n"
-        "• **Расположение**: в центре, рядом с кремлем, на окраине?\n"
-        "• **Тип заведения**: кафе, ресторан, столовая, паб?\n\n"
+        "Чтобы порекомендовать подходящие места, уточните:\n\n"
+        "• Тип кухни: русская, итальянская, европейская, азиатская?\n"
+        "• Бюджет: экономный, средний, премиум?\n"
+        "• Расположение: в центре, рядом с кремлем, на окраине?\n"
+        "• Тип заведения: кафе, ресторан, столовая, паб?\n\n"
         "Что для вас важнее в первую очередь?"
     )
 
 def get_museum_clarification() -> str:
     """Уточняющий вопрос для музеев"""
     return (
-        "🏛️ Уточните, какие музеи вас интересуют:\n\n"
-        "• **Исторические** - Суздальский кремль, музей деревянного зодчества\n"
-        "• **Художественные** - галереи, иконопись\n"
-        "• **Тематические** - медовухи, огурца, купеческого быта\n"
-        "• **Архитектурные** - монастыри, церкви\n\n"
+        "Уточните, какие музеи вас интересуют:\n\n"
+        "• Исторические - Суздальский кремль, музей деревянного зодчества\n"
+        "• Художественные - галереи, иконопись\n"
+        "• Тематические - медовухи, огурца, купеческого быта\n"
+        "• Архитектурные - монастыри, церкви\n\n"
         "Что вас больше привлекает?"
     )
 
 def get_attraction_clarification() -> str:
     """Уточняющий вопрос для достопримечательностей"""
     return (
-        "🏰 Уточните, что хотите посмотреть:\n\n"
-        "• **Архитектура** - кремль, монастыри, церкви\n"
-        "• **История** - древние памятники, музеи\n"
-        "• **Природа** - парки, река Каменка\n"
-        "• **Развлечения** - festivals, мастер-классы\n\n"
+        "Уточните, что хотите посмотреть:\n\n"
+        "• Архитектура - кремль, монастыри, церкви\n"
+        "• История - древние памятники, музеи\n"
+        "• Природа - парки, река Каменка\n"
+        "• Развлечения - festivals, мастер-классы\n\n"
         "Что вас интересует больше всего?"
     )
 
 def get_accommodation_clarification() -> str:
     """Уточняющий вопрос для размещения"""
     return (
-        "🏨 Уточните параметры размещения:\n\n"
-        "• **Бюджет**: эконом, средний, luxury?\n"
-        "• **Тип**: отель, гостиница, хостел, квартира?\n"
-        "• **Расположение**: центр, тихий район, рядом с достопримечательностями?\n"
-        "• **Удобства**: WiFi, парковка, завтрак?\n\n"
+        "Уточните параметры размещения:\n\n"
+        "• Бюджет: эконом, средний, luxury?\n"
+        "• Тип: отель, гостиница, хостел, квартира?\n"
+        "• Расположение: центр, тихий район, рядом с достопримечательностями?\n"
+        "• Удобства: WiFi, парковка, завтрак?\n\n"
         "Что для вас наиболее важно?"
     )
 
 def get_transport_clarification() -> str:
     """Уточняющий вопрос для транспорта"""
     return (
-        "🚗 Уточните, о каком транспорте:\n\n"
-        "• **До Суздаля** - из Москвы, из Владимира\n"
-        "• **Внутри города** - такси, автобусы, пешие маршруты\n"
-        "• **Аренда** - автомобили, велосипеды\n"
-        "• **Экскурсии** - организованные туры\n\n"
+        "Уточните, о каком транспорте:\n\n"
+        "• До Суздаля - из Москвы, из Владимира\n"
+        "• Внутри города - такси, автобусы, пешие маршруты\n"
+        "• Аренда - автомобили, велосипеды\n"
+        "• Экскурсии - организованные туры\n\n"
         "Что именно вас интересует?"
     )
+
 def is_user_response_to_clarification(db: Session, user_id: str, current_question: str) -> bool:
     """Проверяет, является ли текущий вопрос ответом на уточнение"""
     last_assistant_msg = get_last_assistant_message(db, user_id)
@@ -515,19 +516,19 @@ def format_food_response(docs: List[Document]) -> str:
     if not docs:
         return "К сожалению, не нашел подходящих мест по вашему запросу."
     
-    response = ["🍽️ **Рекомендую следующие места:**\n"]
+    response = ["Рекомендую следующие места:\n"]
     for i, doc in enumerate(docs[:5], 1):
         name = doc.metadata.get("name", "Заведение")
         cuisine = doc.metadata.get("type", "кухня не указана")
         address = doc.metadata.get("address", "адрес не указан")
         price = doc.metadata.get("price", "")
         
-        response.append(f"{i}. **{name}**")
-        response.append(f"   🍳 Кухня: {cuisine}")
+        response.append(f"{i}. {name}")
+        response.append(f"   Кухня: {cuisine}")
         if price:
-            response.append(f"   💰 Цены: {price}")
+            response.append(f"   Цены: {price}")
         if address:
-            response.append(f"   📍 Адрес: {address}")
+            response.append(f"   Адрес: {address}")
         response.append("")
     
     response.append("Рекомендую уточнить часы работы по телефону перед посещением!")
@@ -538,19 +539,19 @@ def format_museum_response(docs: List[Document]) -> str:
     if not docs:
         return "К сожалению, не нашел информации о музеях по вашему запросу."
     
-    response = ["🏛️ **Музеи Суздаля:**\n"]
+    response = ["Музеи Суздаля:\n"]
     for i, doc in enumerate(docs[:5], 1):
         name = doc.metadata.get("name", "Музей")
         description = doc.page_content[:150] + "..." if len(doc.page_content) > 150 else doc.page_content
         address = doc.metadata.get("address", "")
         hours = doc.metadata.get("hours", "")
         
-        response.append(f"{i}. **{name}**")
-        response.append(f"   📖 {description}")
+        response.append(f"{i}. {name}")
+        response.append(f"   {description}")
         if address:
-            response.append(f"   📍 {address}")
+            response.append(f"   {address}")
         if hours:
-            response.append(f"   🕒 {hours}")
+            response.append(f"   {hours}")
         response.append("")
     
     return "\n".join(response)
@@ -560,16 +561,16 @@ def format_attraction_response(docs: List[Document]) -> str:
     if not docs:
         return "К сожалению, не нашел достопримечательностей по вашему запросу."
     
-    response = ["🏰 **Достопримечательности:**\n"]
+    response = ["Достопримечательности:\n"]
     for i, doc in enumerate(docs[:5], 1):
         name = doc.metadata.get("name", "Достопримечательность")
         description = doc.page_content[:120] + "..." if len(doc.page_content) > 120 else doc.page_content
         address = doc.metadata.get("address", "")
         
-        response.append(f"{i}. **{name}**")
-        response.append(f"   📖 {description}")
+        response.append(f"{i}. {name}")
+        response.append(f"   {description}")
         if address:
-            response.append(f"   📍 {address}")
+            response.append(f"   {address}")
         response.append("")
     
     return "\n".join(response)
@@ -579,16 +580,16 @@ def format_general_response(docs: List[Document], query: str) -> str:
     if not docs:
         return f"К сожалению, не нашел информации по запросу '{query}'."
     
-    response = [f"**Результаты по запросу '{query}':**\n"]
+    response = [f"Результаты по запросу '{query}':\n"]
     for i, doc in enumerate(docs[:5], 1):
         name = doc.metadata.get("name", "Место")
         description = doc.page_content[:100] + "..." if len(doc.page_content) > 100 else doc.page_content
         address = doc.metadata.get("address", "")
         
-        response.append(f"{i}. **{name}**")
+        response.append(f"{i}. {name}")
         response.append(f"   {description}")
         if address:
-            response.append(f"   📍 {address}")
+            response.append(f"   {address}")
         response.append("")
     
     return "\n".join(response)
