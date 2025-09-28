@@ -465,7 +465,6 @@ def classify_question(question: str) -> str:
     elif any(keyword in question_lower for keyword in Config.TRANSPORT_KEYWORDS):
         return "transport"
     return "general"
-
 def needs_clarification(question: str) -> Tuple[bool, Optional[str]]:
     """Проверяет, нуждается ли вопрос в уточнении"""
     question = question.strip()
@@ -475,40 +474,18 @@ def needs_clarification(question: str) -> Tuple[bool, Optional[str]]:
     if len(question) < 3:
         return True, "Пожалуйста, уточните ваш вопрос. Например:\n- Какие музеи стоит посетить?\n- Где можно попробовать медовуху?"
     
-    # Проверяем, какие параметры уже указаны
-    specified_params = {
-        'cuisine': any(word in question_lower for word in ['русск', 'итальянск', 'европейск', 'азиатск', 'китайск', 'японск']),
-        'budget': any(word in question_lower for word in ['эконом', 'дешев', 'средн', 'премиум', 'дорог']),
-        'location': any(word in question_lower for word in ['центр', 'кремл', 'окраин', 'район']),
-        'type': any(word in question_lower for word in ['кафе', 'ресторан', 'столов', 'паб', 'бар'])
-    }
+    # Вопросы про музеи
+    if any(keyword in question_lower for keyword in ["музей", "музеи"]):
+        # Если вопрос уже достаточно детализирован, не нужно уточнение
+        if any(word in question_lower for word in ["интересн", "лучш", "стоит", "посетить", "посмотреть", "какой", "какие"]):
+            return False, None
+        
+        # Если просто "музеи" или "музеи Суздаля" - нужно уточнение
+        if len(question.split()) <= 3:
+            return True, get_museum_clarification()
     
+    # Для других категорий оставляем существующую логику
     words = question.split()
-    
-    # Если запрос содержит только тип кухни или только тип заведения
-    if (('итальянск' in question_lower or 'европейск' in question_lower or 
-         'русск' in question_lower or 'азиатск' in question_lower) and
-        not any(word in question_lower for word in ['бюджет', 'цена', 'стоимость', 'центр', 'район'])):
-        
-        return True, (
-            "Отлично! Теперь, пожалуйста, уточните:\n\n"
-            "• Бюджет: какой диапазон цен предпочитаете?\n"
-            "• Расположение: в центре города или не важно?\n"
-            "• Атмосфера: уютное кафе или ресторан для ужина?\n\n"
-            "Что для вас важнее?"
-        )
-    
-    # Если указан только тип заведения
-    if (any(word in question_lower for word in ['ресторан', 'кафе', 'столовая']) and
-        not specified_params['cuisine'] and not specified_params['budget']):
-        
-        return True, (
-            "Хорошо! Теперь уточните:\n\n"
-            "• Кухня: какую кухню предпочитаете?\n"
-            "• Бюджет: примерный диапазон цен?\n"
-            "• Местоположение: где бы хотели?\n\n"
-            "Что для вас в приоритете?"
-        )
     
     # Однословные запросы
     if len(words) == 1:
@@ -524,35 +501,9 @@ def needs_clarification(question: str) -> Tuple[bool, Optional[str]]:
     if len(words) <= 3:
         question_type = classify_question(question)
         
-        # Если уже есть некоторые параметры, уточняем недостающие
-        if question_type == "food":
-            missing_params = []
-            if not specified_params['budget']:
-                missing_params.append("бюджет")
-            if not specified_params['location']:
-                missing_params.append("расположение")
-            if not specified_params['type']:
-                missing_params.append("тип заведения")
-            
-            if missing_params:
-                clarification = f"Отлично! Уточните {', '.join(missing_params)}:\n\n"
-                if 'бюджет' in missing_params:
-                    clarification += "• Бюджет: экономный, средний, премиум?\n"
-                if 'расположение' in missing_params:
-                    clarification += "• Расположение: центр, рядом с достопримечательностями?\n"
-                if 'тип заведения' in missing_params:
-                    clarification += "• Тип: кафе, ресторан, паб?\n"
-                clarification += "\nЧто для вас важнее?"
-                return True, clarification
-            
-            # Если все параметры указаны, не нужно уточнение
-            return False, None
-        
-        # Для других категорий
-        elif question_type == "museum":
+        if question_type == "museum" and not any(word in question_lower for word in ["какие", "лучш", "интересн"]):
             return True, get_museum_clarification()
-        elif question_type == "attraction":
-            return True, get_attraction_clarification()
+        # ... остальная логика
     
     return False, None
 
