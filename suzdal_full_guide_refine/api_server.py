@@ -360,7 +360,25 @@ def is_unclear_message(text: str) -> bool:
     if not text or len(text.strip()) < Config.MIN_QUESTION_LENGTH:
         return True
     
-    # Проверяем на бессмысленный текст
+    # Удаляем лишние пробелы и приводим к нижнему регистру
+    text = text.strip().lower()
+    
+    # Проверяем наличие ключевых слов, связанных с Суздалем и туризмом
+    tourism_keywords = [
+        "суздал", "музей", "достопримечатель", "посмотреть", "посетить", 
+        "что", "где", "как", "когда", "сколько", "рекоменд", "интересн",
+        "еда", "кафе", "ресторан", "отель", "гостиница", "транспорт",
+        "кремль", "монастырь", "церковь", "собор", "история", "культура",
+        "тур", "экскурс", "маршрут", "прогулка", "отдых", "путешеств"
+    ]
+    
+    # Проверяем, содержит ли текст хотя бы одно ключевое слово
+    has_tourism_keyword = any(keyword in text for keyword in tourism_keywords)
+    
+    if has_tourism_keyword:
+        return False
+    
+    # Проверяем на бессмысленный текст (только если нет ключевых слов)
     if is_gibberish(text):
         return True
     
@@ -369,6 +387,68 @@ def is_unclear_message(text: str) -> bool:
         return True
     
     return False
+
+def contains_meaningful_words(text: str) -> bool:
+    """Проверяет, содержит ли текст осмысленные слова"""
+    words = re.findall(r'\b[а-яa-z]+\b', text.lower())
+    
+    if not words:
+        return False
+    
+    # Расширяем список значимых слов
+    meaningful_words = [
+        "суздаль", "город", "посмотреть", "посетить", "где", "как", "что", 
+        "когда", "почему", "сколько", "музей", "достопримечательность",
+        "еда", "кафе", "ресторан", "отель", "транспорт", "история",
+        "культура", "архитектура", "кремль", "монастырь", "церковь"
+    ]
+    
+    # Проверяем каждое слово
+    for word in words:
+        if len(word) >= Config.MIN_WORD_LENGTH:
+            # Проверяем прямое совпадение
+            if word in meaningful_words:
+                return True
+            # Проверяем похожие слова
+            for keyword in meaningful_words:
+                if levenshtein_distance(word, keyword) <= Config.MAX_TYPOS_PER_WORD:
+                    return True
+    
+    # Если есть достаточно длинные слова, считаем осмысленным
+    long_words = [word for word in words if len(word) >= 4]
+    return len(long_words) >= 2
+
+def is_gibberish(text: str) -> bool:
+    """Проверяет, является ли текст бессмысленным набором символов"""
+    # Удаляем все не-буквенные символы
+    words = re.findall(r'\b[а-яa-z]+\b', text.lower())
+    
+    if not words:
+        return True
+    
+    # Считаем процент "странных" слов
+    strange_words = 0
+    total_words = len(words)
+    
+    for word in words:
+        if len(word) >= Config.MIN_WORD_LENGTH:
+            # Слово считается странным, если оно не похоже ни на одно известное
+            is_strange = True
+            all_keywords = (Config.FOOD_KEYWORDS + Config.MUSEUM_KEYWORDS + 
+                          Config.ATTRACTION_KEYWORDS + Config.ACCOMMODATION_KEYWORDS + 
+                          Config.TRANSPORT_KEYWORDS + 
+                          ["суздаль", "город", "посмотреть", "посетить", "где", "как", "что", "когда"])
+            
+            for keyword in all_keywords:
+                if levenshtein_distance(word, keyword) <= Config.MAX_TYPOS_PER_WORD:
+                    is_strange = False
+                    break
+            
+            if is_strange and len(word) > 5:
+                strange_words += 1
+    
+    # Если больше 50% слов странные - считаем текст бессмысленным
+    return (strange_words / total_words) > 0.5 if total_words > 0 else True
 
 def classify_question(question: str) -> str:
     """Классификация вопроса по категориям"""
