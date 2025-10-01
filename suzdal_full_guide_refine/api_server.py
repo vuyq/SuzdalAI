@@ -474,36 +474,38 @@ def needs_clarification(question: str) -> Tuple[bool, Optional[str]]:
     if len(question) < 3:
         return True, "Пожалуйста, уточните ваш вопрос. Например:\n- Какие музеи стоит посетить?\n- Где можно попробовать медовуху?"
     
-    # Вопросы про музеи
-    if any(keyword in question_lower for keyword in ["музей", "музеи"]):
-        # Если вопрос уже достаточно детализирован, не нужно уточнение
-        if any(word in question_lower for word in ["интересн", "лучш", "стоит", "посетить", "посмотреть", "какой", "какие"]):
-            return False, None
+    # Определяем категорию вопроса
+    question_type = classify_question(question)
+    
+    # Для вопросов о еде - всегда уточняем, если нет деталей
+    if question_type == "food":
+        # Проверяем, есть ли уже детали в запросе
+        has_details = any([
+            any(word in question_lower for word in ['русск', 'итальянск', 'европейск', 'азиатск']),  # кухня
+            any(word in question_lower for word in ['эконом', 'дешев', 'средн', 'премиум', 'дорог']),  # бюджет
+            any(word in question_lower for word in ['центр', 'кремл', 'окраин', 'район']),  # расположение
+            any(word in question_lower for word in ['завтрак', 'обед', 'ужин']),  # время
+            len(question.split()) > 4  # достаточно длинный запрос
+        ])
         
-        # Если просто "музеи" или "музеи Суздаля" - нужно уточнение
-        if len(question.split()) <= 3:
-            return True, get_museum_clarification()
-    
-    # Для других категорий оставляем существующую логику
-    words = question.split()
-    
-    # Однословные запросы
-    if len(words) == 1:
-        word = words[0].lower()
-        if word in ["еда", "кафе", "ресторан"]:
+        if not has_details:
             return True, get_food_clarification()
-        elif word in ["музей", "музеи"]:
-            return True, get_museum_clarification()
-        elif word in ["достопримечательность", "посмотреть"]:
-            return True, get_attraction_clarification()
     
-    # Короткие вопросы без деталей (2-3 слова)
-    if len(words) <= 3:
-        question_type = classify_question(question)
-        
-        if question_type == "museum" and not any(word in question_lower for word in ["какие", "лучш", "интересн"]):
+    # Для музеев - уточняем только очень короткие запросы
+    elif question_type == "museum":
+        if len(question.split()) <= 2 and not any(word in question_lower for word in ["какие", "лучш", "интересн", "стоит"]):
             return True, get_museum_clarification()
-        # ... остальная логика
+    
+    # Для других категорий - аналогичная логика
+    elif question_type == "attraction":
+        if len(question.split()) <= 2:
+            return True, get_attraction_clarification()
+    elif question_type == "accommodation":
+        if len(question.split()) <= 2:
+            return True, get_accommodation_clarification()
+    elif question_type == "transport":
+        if len(question.split()) <= 2:
+            return True, get_transport_clarification()
     
     return False, None
 
