@@ -554,6 +554,130 @@ def is_user_response_to_clarification(db: Session, user_id: str, current_questio
     
     return has_specific_answer or is_short_answer
 
+def format_food_response(docs: List[Document]) -> str:
+    """Форматирование ответа о местах питания"""
+    if not docs:
+        return "К сожалению, не нашел подходящих мест по вашему запросу."
+    
+    response = ["Рекомендую следующие места:\n"]
+    for i, doc in enumerate(docs[:5], 1):
+        name = doc.metadata.get("name", "Заведение")
+        cuisine = doc.metadata.get("type", "кухня не указана")
+        address = doc.metadata.get("address", "адрес не указан")
+        price = doc.metadata.get("price", "")
+        
+        response.append(f"{i}. {name}")
+        response.append(f"   Кухня: {cuisine}")
+        if price:
+            response.append(f"   Цены: {price}")
+        if address:
+            response.append(f"   Адрес: {address}")
+        response.append("")
+    
+    response.append("Рекомендую уточнить часы работы по телефону перед посещением!")
+    return "\n".join(response)
+
+def format_museum_response(docs: List[Document]) -> str:
+    """Форматирование ответа о музеях"""
+    if not docs:
+        return "К сожалению, не нашел информации о музеях по вашему запросу."
+    
+    response = ["Музеи Суздаля:\n"]
+    for i, doc in enumerate(docs[:5], 1):
+        name = doc.metadata.get("name", "Музей")
+        description = doc.page_content[:150] + "..." if len(doc.page_content) > 150 else doc.page_content
+        address = doc.metadata.get("address", "")
+        hours = doc.metadata.get("hours", "")
+        
+        response.append(f"{i}. {name}")
+        response.append(f"   {description}")
+        if address:
+            response.append(f"   {address}")
+        if hours:
+            response.append(f"   {hours}")
+        response.append("")
+    
+    return "\n".join(response)
+
+def format_attraction_response(docs: List[Document]) -> str:
+    """Форматирование ответа о достопримечательностях"""
+    if not docs:
+        return "К сожалению, не нашел достопримечательностей по вашему запросу."
+    
+    response = ["Достопримечательности:\n"]
+    for i, doc in enumerate(docs[:5], 1):
+        name = doc.metadata.get("name", "Достопримечательность")
+        description = doc.page_content[:120] + "..." if len(doc.page_content) > 120 else doc.page_content
+        address = doc.metadata.get("address", "")
+        
+        response.append(f"{i}. {name}")
+        response.append(f"   {description}")
+        if address:
+            response.append(f"   {address}")
+        response.append("")
+    
+    return "\n".join(response)
+
+def format_accommodation_response(docs: List[Document]) -> str:
+    """Форматирование ответа о размещении"""
+    if not docs:
+        return "К сожалению, не нашел подходящих вариантов размещения по вашему запросу."
+    
+    response = ["Варианты размещения в Суздале:\n"]
+    for i, doc in enumerate(docs[:5], 1):
+        name = doc.metadata.get("name", "Вариант размещения")
+        accommodation_type = doc.metadata.get("type", "тип не указан")
+        address = doc.metadata.get("address", "адрес не указан")
+        price = doc.metadata.get("price", "")
+        
+        response.append(f"{i}. {name}")
+        response.append(f"   Тип: {accommodation_type}")
+        if price:
+            response.append(f"   Цены: {price}")
+        if address:
+            response.append(f"   Адрес: {address}")
+        response.append("")
+    
+    return "\n".join(response)
+
+def format_transport_response(docs: List[Document]) -> str:
+    """Форматирование ответа о транспорте"""
+    if not docs:
+        return "К сожалению, не нашел информации о транспорте по вашему запросу."
+    
+    response = ["Транспорт в Суздале:\n"]
+    for i, doc in enumerate(docs[:5], 1):
+        name = doc.metadata.get("name", "Транспорт")
+        description = doc.page_content[:150] + "..." if len(doc.page_content) > 150 else doc.page_content
+        address = doc.metadata.get("address", "")
+        
+        response.append(f"{i}. {name}")
+        response.append(f"   {description}")
+        if address:
+            response.append(f"   {address}")
+        response.append("")
+    
+    return "\n".join(response)
+
+def format_general_response(docs: List[Document], query: str) -> str:
+    """Форматирование общего ответа"""
+    if not docs:
+        return f"К сожалению, не нашел информации по запросу '{query}'."
+    
+    response = [f"Результаты по запросу '{query}':\n"]
+    for i, doc in enumerate(docs[:5], 1):
+        name = doc.metadata.get("name", "Место")
+        description = doc.page_content[:100] + "..." if len(doc.page_content) > 100 else doc.page_content
+        address = doc.metadata.get("address", "")
+        
+        response.append(f"{i}. {name}")
+        response.append(f"   {description}")
+        if address:
+            response.append(f"   {address}")
+        response.append("")
+    
+    return "\n".join(response)
+
 def generate_clarified_response(db: Session, user_id: str, clarification: str) -> str:
     """Генерация ответа на уточняющую информацию"""
     try:
@@ -627,46 +751,44 @@ def generate_clarified_response(db: Session, user_id: str, clarification: str) -
         logger.error(f"Ошибка генерации уточненного ответа: {e}")
         return "Не удалось обработать ваш запрос. Пожалуйста, попробуйте еще раз."
 
-def format_accommodation_response(docs: List[Document]) -> str:
-    """Форматирование ответа о размещении"""
-    if not docs:
-        return "К сожалению, не нашел подходящих вариантов размещения по вашему запросу."
-    
-    response = ["Варианты размещения в Суздале:\n"]
-    for i, doc in enumerate(docs[:5], 1):
-        name = doc.metadata.get("name", "Вариант размещения")
-        accommodation_type = doc.metadata.get("type", "тип не указан")
-        address = doc.metadata.get("address", "адрес не указан")
-        price = doc.metadata.get("price", "")
-        
-        response.append(f"{i}. {name}")
-        response.append(f"   Тип: {accommodation_type}")
-        if price:
-            response.append(f"   Цены: {price}")
-        if address:
-            response.append(f"   Адрес: {address}")
-        response.append("")
-    
-    return "\n".join(response)
+def generate_ai_response(question: str, context_docs: List[Document], 
+                        web_results: str, dialog_context: str) -> str:
+    """Генерация ответа с помощью GigaChat"""
+    try:
+        TOURISM_PROMPT_TEMPLATE = """
+Ты виртуальный гид по Суздалю. Отвечай на вопросы информативно и дружелюбно.
 
-def format_transport_response(docs: List[Document]) -> str:
-    """Форматирование ответа о транспорте"""
-    if not docs:
-        return "К сожалению, не нашел информации о транспорте по вашему запросу."
-    
-    response = ["Транспорт в Суздале:\n"]
-    for i, doc in enumerate(docs[:5], 1):
-        name = doc.metadata.get("name", "Транспорт")
-        description = doc.page_content[:150] + "..." if len(doc.page_content) > 150 else doc.page_content
-        address = doc.metadata.get("address", "")
+[Контекст диалога]:
+{dialog_context}
+
+[Данные из базы]:
+{context}
+
+[Веб-результаты]:
+{web_search}
+
+[Вопрос]:
+{question}
+
+Ответь подробно и полезно, предлагая конкретные рекомендации.
+Если информации недостаточно - вежливо предложи уточнить запрос.
+"""
+
+        tourism_prompt = PromptTemplate.from_template(TOURISM_PROMPT_TEMPLATE)
         
-        response.append(f"{i}. {name}")
-        response.append(f"   {description}")
-        if address:
-            response.append(f"   {address}")
-        response.append("")
+        prompt_input = {
+            "question": question,
+            "context": "\n\n".join(d.page_content for d in context_docs) if context_docs else "Нет данных в базе",
+            "web_search": web_results,
+            "dialog_context": dialog_context
+        }
+        
+        response = ai_assistant.invoke(tourism_prompt.format(**prompt_input))
+        return response.content if hasattr(response, 'content') else str(response)
     
-    return "\n".join(response)
+    except Exception as e:
+        logger.error(f"Ошибка генерации ответа: {e}")
+        return "Не удалось обработать запрос с помощью AI. Вот что я нашел:\n" + format_general_response(context_docs, question)
 
 def handle_question(db: Session, question: str, user_id: str) -> str:
     """Основная обработка вопроса"""
@@ -716,6 +838,7 @@ def handle_question(db: Session, question: str, user_id: str) -> str:
     except Exception as e:
         logger.error(f"Ошибка обработки вопроса: {e}")
         return "Извините, возникла техническая ошибка. Пожалуйста, попробуйте задать вопрос позже."
+
 # Инициализация приложения
 try:
     download_certificate()
